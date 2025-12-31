@@ -29,6 +29,7 @@ from futurebucks.simulation import (
     _apply_returns,
     _calculate_pre_tax_deductions,
     _calculate_roth_ira_limit,
+    _calculate_accessible_net_worth,
 )
 from futurebucks.tax_engine import (
     calculate_taxes,
@@ -356,8 +357,9 @@ def run_simulation_with_samples(
             return_overrides=return_overrides,
         )
 
-        # Calculate net worth
+        # Calculate net worth (total and accessible)
         net_worth = sum(assets.values())
+        accessible_net_worth = _calculate_accessible_net_worth(assets, scenario.assets)
 
         # Create snapshot
         snapshot = YearlySnapshot(
@@ -373,6 +375,7 @@ def run_simulation_with_samples(
             savings=savings,
             assets=dict(assets),
             net_worth=net_worth,
+            accessible_net_worth=accessible_net_worth,
             cumulative_taxes_paid=cumulative_taxes,
         )
         snapshots.append(snapshot)
@@ -408,14 +411,30 @@ def run_simulation_with_samples(
         fire_target = None
 
     # Check FIRE and retirement milestones
+    # Get starting year for calculating projected IRS retirement age
+    start_year = snapshots[0].year if snapshots else datetime.now().year
+
     for snapshot in snapshots:
         year = snapshot.year
-        net_worth = snapshot.net_worth
+        age = snapshot.age
+        years_from_start = year - start_year
+
+        # Calculate projected IRS retirement age for this year
+        irs_age = scenario.assumptions.get_irs_retirement_age(years_from_start)
+
+        # Determine which net worth to use for FIRE calculation
+        # Before IRS retirement age: only count accessible funds (no 401k, IRA, HSA)
+        # At/after IRS retirement age: count all assets
+        if age < irs_age:
+            fire_net_worth = snapshot.accessible_net_worth
+        else:
+            fire_net_worth = snapshot.net_worth
+
         year_fire_target = snapshot.total_expenses if fire_basis == "current" else fire_target
 
-        if milestones["retirement_ready"] is None and net_worth >= year_fire_target * 25:
+        if milestones["retirement_ready"] is None and snapshot.net_worth >= year_fire_target * 25:
             milestones["retirement_ready"] = year
-        if milestones["fire_number"] is None and net_worth * 0.04 >= year_fire_target:
+        if milestones["fire_number"] is None and fire_net_worth * 0.04 >= year_fire_target:
             milestones["fire_number"] = year
 
     return SimulationResult(

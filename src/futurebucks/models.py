@@ -194,6 +194,15 @@ class Assumptions(BaseModel):
         default=None,
         description="Target annual expenses for FIRE calculation (only used if fire_expense_basis='target')",
     )
+    # IRS retirement age settings (for penalty-free retirement account access)
+    irs_retirement_age: float = Field(
+        default=59.5,
+        description="Current IRS retirement age for penalty-free 401k/IRA withdrawals",
+    )
+    irs_retirement_age_increase_per_decade: float = Field(
+        default=1.0,
+        description="Expected increase in IRS retirement age per decade (e.g., 1.0 means 59.5 -> 60.5 over 10 years)",
+    )
     # Monte Carlo mode options
     use_conservative_defaults: bool = Field(
         default=False,
@@ -217,6 +226,18 @@ class Assumptions(BaseModel):
     def get_inflation_rate(self, category: str = "general") -> Distribution:
         """Get inflation rate for a category."""
         return self.inflation_rates.get_rate(category)
+
+    def get_irs_retirement_age(self, years_from_now: int = 0) -> float:
+        """Get the projected IRS retirement age for a future year.
+
+        Args:
+            years_from_now: Number of years in the future
+
+        Returns:
+            Projected IRS retirement age (increases over time)
+        """
+        decades = years_from_now / 10.0
+        return self.irs_retirement_age + (decades * self.irs_retirement_age_increase_per_decade)
 
 
 class HealthcareConfig(BaseModel):
@@ -374,6 +395,10 @@ class YearlySnapshot(BaseModel):
     savings: float
     assets: dict[str, float] = Field(description="Asset name -> balance")
     net_worth: float
+    accessible_net_worth: float = Field(
+        default=0.0,
+        description="Net worth excluding retirement accounts (401k, IRA, HSA) - accessible before IRS retirement age",
+    )
     cumulative_taxes_paid: float = 0.0
 
 

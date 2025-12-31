@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from copy import deepcopy
+from typing import Literal
 
 from futurebucks.models import (
     Scenario,
@@ -28,6 +29,41 @@ from futurebucks.tax_engine import (
     BASE_ROTH_IRA_INCOME_LIMIT_START,
     BASE_ROTH_IRA_INCOME_LIMIT_END,
 )
+
+
+# Asset types that are locked until IRS retirement age (penalty for early withdrawal)
+RETIREMENT_ACCOUNT_TYPES = {"401k", "roth_ira", "traditional_ira", "hsa"}
+
+
+def _calculate_accessible_net_worth(
+    assets: dict[str, float],
+    asset_configs: list[Asset],
+) -> float:
+    """Calculate net worth from non-retirement accounts only.
+
+    These are funds accessible before IRS retirement age without penalty:
+    - Taxable brokerage accounts
+    - Real estate equity
+    - Other assets (cash, vehicles, etc.)
+
+    Excludes:
+    - 401k, Traditional IRA, Roth IRA, HSA (locked until ~59.5)
+
+    Note: Roth contributions (not earnings) can technically be withdrawn
+    penalty-free, but we take a conservative approach and exclude all Roth.
+    """
+    config_by_name = {a.name: a for a in asset_configs}
+    accessible = 0.0
+
+    for name, balance in assets.items():
+        config = config_by_name.get(name)
+        if config and config.type not in RETIREMENT_ACCOUNT_TYPES:
+            accessible += balance
+        elif not config:
+            # Unknown asset - assume accessible (conservative for unknown)
+            accessible += balance
+
+    return accessible
 
 
 def _calculate_roth_ira_limit(
@@ -615,8 +651,9 @@ def run_simulation(scenario: Scenario) -> SimulationResult:
             default_return=scenario.assumptions.market_return_mean,
         )
 
-        # Calculate net worth
+        # Calculate net worth (total and accessible)
         net_worth = sum(assets.values())
+        accessible_net_worth = _calculate_accessible_net_worth(assets, scenario.assets)
 
         # Create snapshot
         snapshot = YearlySnapshot(
@@ -632,6 +669,7 @@ def run_simulation(scenario: Scenario) -> SimulationResult:
             savings=savings,
             assets=dict(assets),
             net_worth=net_worth,
+            accessible_net_worth=accessible_net_worth,
             cumulative_taxes_paid=cumulative_taxes,
         )
         snapshots.append(snapshot)
@@ -676,9 +714,24 @@ def run_simulation(scenario: Scenario) -> SimulationResult:
         fire_target = None
 
     # Check FIRE and retirement milestones
+    # Get starting year for calculating projected IRS retirement age
+    start_year = snapshots[0].year if snapshots else datetime.now().year
+
     for snapshot in snapshots:
         year = snapshot.year
-        net_worth = snapshot.net_worth
+        age = snapshot.age
+        years_from_start = year - start_year
+
+        # Calculate projected IRS retirement age for this year
+        irs_age = scenario.assumptions.get_irs_retirement_age(years_from_start)
+
+        # Determine which net worth to use for FIRE calculation
+        # Before IRS retirement age: only count accessible funds (no 401k, IRA, HSA)
+        # At/after IRS retirement age: count all assets
+        if age < irs_age:
+            fire_net_worth = snapshot.accessible_net_worth
+        else:
+            fire_net_worth = snapshot.net_worth
 
         # For "current" basis, use that year's expenses
         if fire_basis == "current":
@@ -687,11 +740,13 @@ def run_simulation(scenario: Scenario) -> SimulationResult:
             year_fire_target = fire_target
 
         # Check retirement readiness (25x annual expenses based on fire target)
-        if milestones["retirement_ready"] is None and net_worth >= year_fire_target * 25:
+        # Uses total net worth since this is about overall readiness
+        if milestones["retirement_ready"] is None and snapshot.net_worth >= year_fire_target * 25:
             milestones["retirement_ready"] = year
 
         # FIRE number: 4% safe withdrawal rate covers expenses
-        if milestones["fire_number"] is None and net_worth * 0.04 >= year_fire_target:
+        # Uses accessible net worth if before IRS retirement age
+        if milestones["fire_number"] is None and fire_net_worth * 0.04 >= year_fire_target:
             milestones["fire_number"] = year
 
     return SimulationResult(
