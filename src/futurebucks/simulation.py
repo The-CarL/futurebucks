@@ -108,8 +108,17 @@ def _calculate_expenses(
     year: int,
     start_year: int,
     inflation_rate: float,
+    inflation_rate_overrides: dict[str, float] | None = None,
 ) -> float:
-    """Calculate total expenses for a year."""
+    """Calculate total expenses for a year.
+
+    Args:
+        expenses: List of expense items
+        year: Current simulation year
+        start_year: First year of simulation
+        inflation_rate: Default inflation rate (general)
+        inflation_rate_overrides: Optional dict of category -> rate for Monte Carlo
+    """
     total = 0.0
     for expense in expenses:
         if not _is_active(expense, year):
@@ -119,13 +128,54 @@ def _calculate_expenses(
         years_active = max(0, year - expense_start)
 
         if expense.inflation_adjusted:
-            amount = expense.amount * ((1 + inflation_rate) ** years_active)
+            # Use category-specific inflation rate if available
+            category = getattr(expense, "inflation_category", "general")
+            if inflation_rate_overrides and category in inflation_rate_overrides:
+                rate = inflation_rate_overrides[category]
+            else:
+                rate = inflation_rate
+
+            amount = expense.amount * ((1 + rate) ** years_active)
         else:
             amount = expense.amount
 
         total += amount
 
     return total
+
+
+def _calculate_healthcare_expenses(
+    scenario: "Scenario",
+    year: int,
+    start_year: int,
+    healthcare_inflation_rate: float,
+) -> float:
+    """Calculate healthcare expenses for a year.
+
+    Args:
+        scenario: The scenario configuration
+        year: Current simulation year
+        start_year: First year of simulation
+        healthcare_inflation_rate: Healthcare-specific inflation rate
+
+    Returns:
+        Annual healthcare cost (inflation-adjusted), or 0 if no healthcare config
+    """
+    if scenario.healthcare is None:
+        return 0.0
+
+    # Get base cost for this year (handles employer vs marketplace transition)
+    base_cost = scenario.healthcare.calculate_annual_cost(
+        year=year,
+        person_birth_year=scenario.person.birth_year,
+    )
+
+    if base_cost == 0.0:
+        return 0.0
+
+    # Apply healthcare inflation from simulation start
+    years_active = max(0, year - start_year)
+    return base_cost * ((1 + healthcare_inflation_rate) ** years_active)
 
 
 def _apply_life_events(
@@ -440,42 +490,44 @@ def run_simulation(scenario: Scenario) -> SimulationResult:
 
     cumulative_taxes = 0.0
     # Extract mean from Distribution for deterministic simulation
-    inflation_rate = float(scenario.assumptions.inflation_rate.mean)
+    # Use general inflation rate for tax bracket adjustments
+    general_inflation = float(scenario.assumptions.get_inflation_rate("general").mean)
+    healthcare_inflation = float(scenario.assumptions.get_inflation_rate("healthcare").mean)
 
     for year in range(current_year, end_year + 1):
         age = year - scenario.person.birth_year
         years_from_base = max(0, year - BASE_YEAR)
 
-        # Calculate inflation-adjusted values for this year
+        # Calculate inflation-adjusted values for this year (using general inflation)
         adjusted_standard_deduction = inflate_value(
-            BASE_STANDARD_DEDUCTION_MFJ, inflation_rate, years_from_base
+            BASE_STANDARD_DEDUCTION_MFJ, general_inflation, years_from_base
         )
         adjusted_ss_wage_cap = inflate_value(
-            BASE_SS_WAGE_CAP, inflation_rate, years_from_base
+            BASE_SS_WAGE_CAP, general_inflation, years_from_base
         )
         adjusted_401k_limit = inflate_value(
-            BASE_401K_LIMIT, inflation_rate, years_from_base
+            BASE_401K_LIMIT, general_inflation, years_from_base
         )
         adjusted_401k_catchup = inflate_value(
-            BASE_401K_CATCHUP, inflation_rate, years_from_base
+            BASE_401K_CATCHUP, general_inflation, years_from_base
         )
         adjusted_ira_limit = inflate_value(
-            BASE_IRA_LIMIT, inflation_rate, years_from_base
+            BASE_IRA_LIMIT, general_inflation, years_from_base
         )
         adjusted_ira_catchup = inflate_value(
-            BASE_IRA_CATCHUP, inflation_rate, years_from_base
+            BASE_IRA_CATCHUP, general_inflation, years_from_base
         )
         adjusted_hsa_limit = inflate_value(
-            BASE_HSA_LIMIT_FAMILY, inflation_rate, years_from_base
+            BASE_HSA_LIMIT_FAMILY, general_inflation, years_from_base
         )
         adjusted_roth_phase_out_start = inflate_value(
-            BASE_ROTH_IRA_INCOME_LIMIT_START, inflation_rate, years_from_base
+            BASE_ROTH_IRA_INCOME_LIMIT_START, general_inflation, years_from_base
         )
         adjusted_roth_phase_out_end = inflate_value(
-            BASE_ROTH_IRA_INCOME_LIMIT_END, inflation_rate, years_from_base
+            BASE_ROTH_IRA_INCOME_LIMIT_END, general_inflation, years_from_base
         )
         adjusted_brackets = inflate_brackets(
-            FEDERAL_BRACKETS_2024_MFJ, inflation_rate, years_from_base
+            FEDERAL_BRACKETS_2024_MFJ, general_inflation, years_from_base
         )
 
         # Apply life events for this year
@@ -485,7 +537,7 @@ def run_simulation(scenario: Scenario) -> SimulationResult:
             expenses=expenses,
             assets=assets,
             events=scenario.life_events,
-            inflation_rate=inflation_rate,
+            inflation_rate=general_inflation,
             start_year=current_year,
         )
 
@@ -493,10 +545,16 @@ def run_simulation(scenario: Scenario) -> SimulationResult:
         gross_income = _calculate_gross_income(income_sources, year, current_year)
         gross_income += windfall
 
-        # Calculate expenses
+        # Calculate regular expenses (with category-specific inflation)
         total_expenses = _calculate_expenses(
-            expenses, year, current_year, inflation_rate
+            expenses, year, current_year, general_inflation
         )
+
+        # Add healthcare expenses (with healthcare-specific inflation)
+        healthcare_expenses = _calculate_healthcare_expenses(
+            scenario, year, current_year, healthcare_inflation
+        )
+        total_expenses += healthcare_expenses
 
         # Estimate savings for pre-tax deduction calculation
         estimated_savings = gross_income * 0.7 - total_expenses  # Rough estimate

@@ -17,11 +17,13 @@ from futurebucks.models import (
     IncomeSource,
     Expense,
     Distribution,
+    DEFAULT_VOLATILITIES,
 )
 from futurebucks.simulation import (
     _is_active,
     _calculate_gross_income,
     _calculate_expenses,
+    _calculate_healthcare_expenses,
     _apply_life_events,
     _allocate_savings,
     _apply_returns,
@@ -54,51 +56,94 @@ class SampledScenario:
         self.rng = rng
         self.num_years = scenario.simulation_years + 1
 
+        # Check for conservative defaults mode
+        self.use_conservative = scenario.assumptions.use_conservative_defaults
+
         # Pre-sample all stochastic values
         self._sample_all_values()
+
+    def _apply_conservative_adjustment(self, dist: Distribution, is_return: bool = False) -> Distribution:
+        """Apply conservative adjustments to a distribution.
+
+        Conservative mode:
+        - Reduces return means by 1% (e.g., 7% -> 6%)
+        - Increases stddevs by 20% (e.g., 0.15 -> 0.18)
+        """
+        if not self.use_conservative:
+            return dist
+
+        new_mean = dist.mean - 0.01 if is_return else dist.mean
+        new_stddev = dist.stddev * 1.20 if dist.stddev > 0 else dist.stddev
+
+        return Distribution(
+            type=dist.type,
+            mean=new_mean,
+            stddev=new_stddev,
+            min=dist.min,
+            max=dist.max,
+        )
 
     def _sample_all_values(self):
         """Pre-sample all stochastic values for each year."""
         assumptions = self.scenario.assumptions
 
-        # Sample inflation rate per year (use default stddev if not specified)
-        inflation_dist = assumptions.inflation_rate
-        if inflation_dist.stddev == 0:
-            # Default inflation volatility of 1%
-            inflation_dist = Distribution(
-                type=inflation_dist.type,
-                mean=inflation_dist.mean,
-                stddev=0.01
+        # Sample category-specific inflation rates
+        self.inflation_samples = {}
+        for category in ["general", "healthcare", "education", "housing"]:
+            inflation_dist = assumptions.get_inflation_rate(category)
+
+            # Apply default stddev from DEFAULT_VOLATILITIES if not specified
+            if inflation_dist.stddev == 0:
+                default_key = f"inflation_{category}"
+                default_stddev = DEFAULT_VOLATILITIES.get(default_key, 0.01)
+                inflation_dist = Distribution(
+                    type=inflation_dist.type,
+                    mean=inflation_dist.mean,
+                    stddev=default_stddev,
+                )
+
+            # Apply conservative adjustments
+            inflation_dist = self._apply_conservative_adjustment(inflation_dist)
+            self.inflation_samples[category] = self._sample_distribution(
+                inflation_dist, self.num_years
             )
-        self.inflation_samples = self._sample_distribution(inflation_dist, self.num_years)
 
         # Sample asset returns per year per asset
-        # Use market_return_stddev from assumptions as fallback
-        default_return_stddev = assumptions.market_return_stddev
         self.asset_return_samples = {}
         for asset in self.scenario.assets:
             asset_dist = asset.expected_return
-            if asset_dist.stddev == 0 and asset.type not in ("other",):
-                # Use market stddev as default for investment assets
+
+            # Apply default stddev from DEFAULT_VOLATILITIES based on asset type
+            if asset_dist.stddev == 0:
+                default_stddev = DEFAULT_VOLATILITIES.get(asset.type, 0.10)
                 asset_dist = Distribution(
                     type=asset_dist.type,
                     mean=asset_dist.mean,
-                    stddev=default_return_stddev if asset.type != "real_estate" else 0.05
+                    stddev=default_stddev,
                 )
+
+            # Apply conservative adjustments (returns get mean reduction)
+            asset_dist = self._apply_conservative_adjustment(asset_dist, is_return=True)
             self.asset_return_samples[asset.name] = self._sample_distribution(
                 asset_dist, self.num_years
             )
 
-        # Sample income growth per year per source (default 2% stddev)
+        # Sample income growth per year per source
         self.income_growth_samples = {}
         for source in self.scenario.income_sources:
             growth_dist = source.growth_rate
+
+            # Apply default stddev from DEFAULT_VOLATILITIES
             if growth_dist.stddev == 0:
+                default_stddev = DEFAULT_VOLATILITIES.get("income_growth", 0.03)
                 growth_dist = Distribution(
                     type=growth_dist.type,
                     mean=growth_dist.mean,
-                    stddev=0.02  # Default income growth volatility
+                    stddev=default_stddev,
                 )
+
+            # Apply conservative adjustments
+            growth_dist = self._apply_conservative_adjustment(growth_dist)
             self.income_growth_samples[source.name] = self._sample_distribution(
                 growth_dist, self.num_years
             )
@@ -108,9 +153,12 @@ class SampledScenario:
         # Use the Distribution's sample method to respect distribution type
         return np.array([dist.sample(self.rng) for _ in range(n)])
 
-    def get_inflation_rate(self, year_index: int) -> float:
-        """Get sampled inflation rate for a year."""
-        return float(self.inflation_samples[year_index])
+    def get_inflation_rate(self, year_index: int, category: str = "general") -> float:
+        """Get sampled inflation rate for a year and category."""
+        if category in self.inflation_samples:
+            return float(self.inflation_samples[category][year_index])
+        # Fallback to general inflation
+        return float(self.inflation_samples["general"][year_index])
 
     def get_asset_return(self, asset_name: str, year_index: int) -> float:
         """Get sampled return for an asset in a year."""
@@ -164,39 +212,48 @@ def run_simulation_with_samples(
         age = year - scenario.person.birth_year
         years_from_base = max(0, year - BASE_YEAR)
 
-        # Get sampled inflation for this year
-        inflation_rate = sampled.get_inflation_rate(year_idx)
+        # Get sampled inflation rates for this year (category-specific)
+        general_inflation = sampled.get_inflation_rate(year_idx, "general")
+        healthcare_inflation = sampled.get_inflation_rate(year_idx, "healthcare")
 
-        # Calculate inflation-adjusted values for this year
+        # Build inflation overrides for expense calculation
+        inflation_rate_overrides = {
+            "general": general_inflation,
+            "healthcare": healthcare_inflation,
+            "education": sampled.get_inflation_rate(year_idx, "education"),
+            "housing": sampled.get_inflation_rate(year_idx, "housing"),
+        }
+
+        # Calculate inflation-adjusted values for this year (using general inflation)
         adjusted_standard_deduction = inflate_value(
-            BASE_STANDARD_DEDUCTION_MFJ, inflation_rate, years_from_base
+            BASE_STANDARD_DEDUCTION_MFJ, general_inflation, years_from_base
         )
         adjusted_ss_wage_cap = inflate_value(
-            BASE_SS_WAGE_CAP, inflation_rate, years_from_base
+            BASE_SS_WAGE_CAP, general_inflation, years_from_base
         )
         adjusted_401k_limit = inflate_value(
-            BASE_401K_LIMIT, inflation_rate, years_from_base
+            BASE_401K_LIMIT, general_inflation, years_from_base
         )
         adjusted_401k_catchup = inflate_value(
-            BASE_401K_CATCHUP, inflation_rate, years_from_base
+            BASE_401K_CATCHUP, general_inflation, years_from_base
         )
         adjusted_ira_limit = inflate_value(
-            BASE_IRA_LIMIT, inflation_rate, years_from_base
+            BASE_IRA_LIMIT, general_inflation, years_from_base
         )
         adjusted_ira_catchup = inflate_value(
-            BASE_IRA_CATCHUP, inflation_rate, years_from_base
+            BASE_IRA_CATCHUP, general_inflation, years_from_base
         )
         adjusted_hsa_limit = inflate_value(
-            BASE_HSA_LIMIT_FAMILY, inflation_rate, years_from_base
+            BASE_HSA_LIMIT_FAMILY, general_inflation, years_from_base
         )
         adjusted_roth_phase_out_start = inflate_value(
-            BASE_ROTH_IRA_INCOME_LIMIT_START, inflation_rate, years_from_base
+            BASE_ROTH_IRA_INCOME_LIMIT_START, general_inflation, years_from_base
         )
         adjusted_roth_phase_out_end = inflate_value(
-            BASE_ROTH_IRA_INCOME_LIMIT_END, inflation_rate, years_from_base
+            BASE_ROTH_IRA_INCOME_LIMIT_END, general_inflation, years_from_base
         )
         adjusted_brackets = inflate_brackets(
-            FEDERAL_BRACKETS_2024_MFJ, inflation_rate, years_from_base
+            FEDERAL_BRACKETS_2024_MFJ, general_inflation, years_from_base
         )
 
         # Apply life events for this year
@@ -206,7 +263,7 @@ def run_simulation_with_samples(
             expenses=expenses,
             assets=assets,
             events=scenario.life_events,
-            inflation_rate=inflation_rate,
+            inflation_rate=general_inflation,
             start_year=current_year,
         )
 
@@ -222,10 +279,16 @@ def run_simulation_with_samples(
         )
         gross_income += windfall
 
-        # Calculate expenses
+        # Calculate regular expenses with category-specific inflation
         total_expenses = _calculate_expenses(
-            expenses, year, current_year, inflation_rate
+            expenses, year, current_year, general_inflation, inflation_rate_overrides
         )
+
+        # Add healthcare expenses with healthcare-specific inflation
+        healthcare_expenses = _calculate_healthcare_expenses(
+            scenario, year, current_year, healthcare_inflation
+        )
+        total_expenses += healthcare_expenses
 
         # Estimate savings for pre-tax deduction calculation
         estimated_savings = gross_income * 0.7 - total_expenses
@@ -381,9 +444,12 @@ def run_monte_carlo(
     if config is None:
         config = scenario.monte_carlo
 
+    # Use effective_num_simulations which handles detailed_analysis_mode
+    num_sims = config.effective_num_simulations
+
     # Generate seeds for reproducibility
     master_rng = np.random.default_rng(config.seed)
-    seeds = master_rng.integers(0, 2**31, size=config.num_simulations)
+    seeds = master_rng.integers(0, 2**31, size=num_sims)
 
     results: list[SimulationResult] = []
 
@@ -395,13 +461,13 @@ def run_monte_carlo(
         results.append(result)
 
         if progress_callback:
-            progress_callback(i + 1, config.num_simulations)
+            progress_callback(i + 1, num_sims)
 
-    return _aggregate_results(scenario.name, results, config.percentiles)
+    return _aggregate_results(scenario, results, config.percentiles)
 
 
 def _aggregate_results(
-    scenario_name: str,
+    scenario: Scenario,
     results: list[SimulationResult],
     percentiles: list[int],
 ) -> MonteCarloResult:
@@ -434,14 +500,19 @@ def _aggregate_results(
         )
         snapshots.append(snapshot)
 
-    # Calculate milestone probabilities
-    milestone_probs = _calculate_milestone_probabilities(results)
+    # Calculate milestone probabilities with retirement context
+    retirement_year = scenario.person.birth_year + scenario.person.retirement_age
+    milestone_probs = _calculate_milestone_probabilities(
+        results,
+        target_year=retirement_year,
+        target_age=scenario.person.retirement_age,
+    )
 
     # Final net worth distribution
     final_net_worths = [r.snapshots[-1].net_worth for r in results]
 
     return MonteCarloResult(
-        scenario_name=scenario_name,
+        scenario_name=scenario.name,
         num_simulations=num_sims,
         snapshots=snapshots,
         milestone_probabilities=milestone_probs,
@@ -451,8 +522,16 @@ def _aggregate_results(
 
 def _calculate_milestone_probabilities(
     results: list[SimulationResult],
+    target_year: int | None = None,
+    target_age: int | None = None,
 ) -> list[MilestoneProbability]:
-    """Calculate probability of reaching various milestones."""
+    """Calculate probability of reaching various milestones.
+
+    Args:
+        results: List of simulation results
+        target_year: Target year for "probability by" calculations (e.g., retirement year)
+        target_age: Target age for display purposes
+    """
     # Determine which milestones to show based on final net worth range
     final_net_worths = [r.snapshots[-1].net_worth for r in results]
     median_final = float(np.median(final_net_worths))
@@ -482,7 +561,14 @@ def _calculate_milestone_probabilities(
             if year is not None:
                 years_achieved.append(year)
 
+        # Overall probability of ever reaching
         probability = len(years_achieved) / len(results)
+
+        # Probability of reaching BY the target year (e.g., retirement age)
+        probability_by_target = None
+        if target_year is not None:
+            achieved_by_target = sum(1 for y in years_achieved if y <= target_year)
+            probability_by_target = achieved_by_target / len(results)
 
         if years_achieved:
             years_achieved_sorted = sorted(years_achieved)
@@ -496,6 +582,9 @@ def _calculate_milestone_probabilities(
             milestone=name,
             target_value=target,
             probability=probability,
+            probability_by_target=probability_by_target,
+            target_year=target_year,
+            target_age=target_age,
             median_year=median_year,
             p10_year=p10_year,
             p90_year=p90_year,

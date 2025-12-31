@@ -1,8 +1,11 @@
 """Pydantic models for financial simulation configuration and state."""
 
 from typing import Annotated, Literal, Union
+import logging
 import numpy as np
-from pydantic import BaseModel, Field, BeforeValidator
+from pydantic import BaseModel, Field, BeforeValidator, model_validator
+
+logger = logging.getLogger(__name__)
 
 
 class Distribution(BaseModel):
@@ -107,6 +110,10 @@ class Expense(BaseModel):
     name: str
     amount: float = Field(description="Annual expense amount")
     inflation_adjusted: bool = True
+    inflation_category: str = Field(
+        default="general",
+        description="Inflation category: 'general', 'healthcare', 'education', etc.",
+    )
     start_year: int | None = None
     end_year: int | None = None
 
@@ -120,12 +127,51 @@ class LifeEvent(BaseModel):
     details: dict = Field(default_factory=dict, description="Event-specific details")
 
 
+class CategoryInflationRates(BaseModel):
+    """Category-specific inflation rates.
+
+    Different expense categories often inflate at different rates:
+    - Healthcare typically inflates at 5-6% annually (faster than general)
+    - Education inflates at 4-5% annually
+    - General goods/services at 2-3%
+    """
+
+    general: StochasticFloat = Field(
+        default_factory=lambda: Distribution(mean=0.025, stddev=0.01),
+        description="General inflation rate (2.5% historical average)",
+    )
+    healthcare: StochasticFloat = Field(
+        default_factory=lambda: Distribution(mean=0.055, stddev=0.015),
+        description="Healthcare inflation (historically 5-6% annually)",
+    )
+    education: StochasticFloat = Field(
+        default_factory=lambda: Distribution(mean=0.04, stddev=0.01),
+        description="Education cost inflation (historically 4-5%)",
+    )
+    housing: StochasticFloat = Field(
+        default_factory=lambda: Distribution(mean=0.03, stddev=0.015),
+        description="Housing cost inflation",
+    )
+
+    def get_rate(self, category: str) -> Distribution:
+        """Get inflation rate for a category, defaulting to general if not found."""
+        if hasattr(self, category):
+            return getattr(self, category)
+        logger.warning(f"Unknown inflation category '{category}', using general rate")
+        return self.general
+
+
 class Assumptions(BaseModel):
     """Economic and tax assumptions for the simulation."""
 
-    inflation_rate: StochasticFloat = Field(
-        default_factory=lambda: Distribution(mean=0.025, stddev=0.0),
-        description="Annual inflation rate (can be distribution)",
+    # Support both old single inflation_rate and new category-specific rates
+    inflation_rate: StochasticFloat | None = Field(
+        default=None,
+        description="DEPRECATED: Use inflation_rates instead. Kept for backward compatibility.",
+    )
+    inflation_rates: CategoryInflationRates = Field(
+        default_factory=CategoryInflationRates,
+        description="Category-specific inflation rates",
     )
     market_return_mean: float = 0.07  # Kept for reference/default
     market_return_stddev: float = 0.15  # Kept for reference/default
@@ -148,15 +194,150 @@ class Assumptions(BaseModel):
         default=None,
         description="Target annual expenses for FIRE calculation (only used if fire_expense_basis='target')",
     )
+    # Monte Carlo mode options
+    use_conservative_defaults: bool = Field(
+        default=False,
+        description="If True, reduces return means by 1% and increases stddevs by 20% for stress testing",
+    )
+
+    @model_validator(mode="after")
+    def handle_legacy_inflation_rate(self) -> "Assumptions":
+        """Convert legacy single inflation_rate to category-specific rates."""
+        if self.inflation_rate is not None:
+            # Use the legacy rate as the general rate
+            self.inflation_rates = CategoryInflationRates(
+                general=self.inflation_rate,
+                healthcare=Distribution(mean=0.055, stddev=0.015),  # Default healthcare
+                education=Distribution(mean=0.04, stddev=0.01),  # Default education
+                housing=Distribution(mean=0.03, stddev=0.015),  # Default housing
+            )
+            logger.info("Converted legacy inflation_rate to inflation_rates.general")
+        return self
+
+    def get_inflation_rate(self, category: str = "general") -> Distribution:
+        """Get inflation rate for a category."""
+        return self.inflation_rates.get_rate(category)
+
+
+class HealthcareConfig(BaseModel):
+    """Healthcare cost configuration for pre-Medicare years.
+
+    Models healthcare expenses from current age until Medicare eligibility (age 65).
+    Supports transition from employer-subsidized coverage to marketplace/COBRA.
+
+    Annual cost calculation:
+    - During employer coverage: employer_monthly_cost * 12
+    - After employer coverage: (monthly_premium * 12) + annual_deductible +
+                               (annual_out_of_pocket_max * expected_utilization)
+    """
+
+    coverage_type: Literal["individual", "family"] = Field(
+        default="family",
+        description="Type of healthcare coverage",
+    )
+    # Employer-subsidized period
+    employer_subsidized_until: int | None = Field(
+        default=None,
+        description="Year when employer coverage ends (None if no employer coverage)",
+    )
+    employer_monthly_cost: float = Field(
+        default=400.0,
+        description="Monthly cost while employer-subsidized",
+    )
+    # Post-employer coverage (ACA marketplace, COBRA, etc.)
+    monthly_premium: float = Field(
+        default=1500.0,
+        description="Monthly premium for marketplace/COBRA coverage",
+    )
+    annual_deductible: float = Field(
+        default=6000.0,
+        description="Annual deductible amount",
+    )
+    annual_out_of_pocket_max: float = Field(
+        default=12000.0,
+        description="Annual out-of-pocket maximum",
+    )
+    expected_utilization: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Expected utilization as fraction of OOP max (0.0-1.0)",
+    )
+
+    def calculate_annual_cost(self, year: int, person_birth_year: int) -> float:
+        """Calculate annual healthcare cost for a given year.
+
+        Args:
+            year: The simulation year
+            person_birth_year: Birth year of the person (to calculate age)
+
+        Returns:
+            Annual healthcare cost, or 0 if age >= 65 (Medicare eligible)
+        """
+        age = year - person_birth_year
+
+        # No healthcare modeling after Medicare eligibility
+        if age >= 65:
+            return 0.0
+
+        # Check if still in employer-subsidized period
+        if self.employer_subsidized_until and year < self.employer_subsidized_until:
+            return self.employer_monthly_cost * 12
+
+        # Full marketplace/COBRA cost
+        return (
+            (self.monthly_premium * 12)
+            + self.annual_deductible
+            + (self.annual_out_of_pocket_max * self.expected_utilization)
+        )
+
+
+# Default volatilities for Monte Carlo simulation
+# Based on historical data and financial planning best practices
+DEFAULT_VOLATILITIES = {
+    # Asset types - based on historical volatility of underlying asset classes
+    "401k": 0.15,           # Equity-heavy retirement accounts (S&P 500 ~15% annual vol)
+    "roth_ira": 0.15,       # Similar to 401k
+    "traditional_ira": 0.15,
+    "taxable": 0.15,        # Typically equity-heavy
+    "hsa": 0.12,            # Often more conservative allocation
+    "real_estate": 0.08,    # Less volatile but illiquid (Case-Shiller ~5-10%)
+    "other": 0.10,          # Mixed/unknown assets
+
+    # Income volatility - job raises are somewhat predictable
+    "income_growth": 0.03,  # Based on variance in annual raise distributions
+
+    # Inflation volatility - based on historical CPI variation
+    "inflation_general": 0.01,      # General CPI volatility
+    "inflation_healthcare": 0.015,  # Healthcare CPI more volatile
+    "inflation_education": 0.01,
+    "inflation_housing": 0.015,
+}
 
 
 class MonteCarloConfig(BaseModel):
     """Configuration for Monte Carlo simulation."""
 
     enabled: bool = False
-    num_simulations: int = Field(default=1000, ge=10, le=10000)
+    num_simulations: int = Field(
+        default=2000,  # Increased from 1000 for better tail coverage
+        ge=10,
+        le=100000,
+        description="Number of simulations (2000 default, 10000+ for detailed analysis)",
+    )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
     percentiles: list[int] = Field(default=[10, 25, 50, 75, 90])
+    detailed_analysis_mode: bool = Field(
+        default=False,
+        description="If True, runs 10000 simulations for better statistical coverage",
+    )
+
+    @property
+    def effective_num_simulations(self) -> int:
+        """Get actual number of simulations to run."""
+        if self.detailed_analysis_mode:
+            return 10000
+        return self.num_simulations
 
 
 class Scenario(BaseModel):
@@ -170,6 +351,10 @@ class Scenario(BaseModel):
     expenses: list[Expense] = Field(default_factory=list)
     life_events: list[LifeEvent] = Field(default_factory=list)
     assumptions: Assumptions = Field(default_factory=Assumptions)
+    healthcare: HealthcareConfig | None = Field(
+        default=None,
+        description="Healthcare cost configuration (pre-Medicare)",
+    )
     simulation_years: int = 30
     monte_carlo: MonteCarloConfig = Field(default_factory=MonteCarloConfig)
 
@@ -231,10 +416,13 @@ class MilestoneProbability(BaseModel):
 
     milestone: str
     target_value: float | None = None
-    probability: float  # 0.0 to 1.0
+    probability: float  # 0.0 to 1.0 - probability of ever reaching during simulation
+    probability_by_target: float | None = None  # Probability of reaching by target year
+    target_year: int | None = None  # The target year (e.g., retirement year)
+    target_age: int | None = None  # The target age for context
     median_year: int | None = None  # Year when 50% of runs achieve it
-    p10_year: int | None = None  # Year when 10% of runs achieve it
-    p90_year: int | None = None  # Year when 90% of runs achieve it
+    p10_year: int | None = None  # Year when 10% of runs achieve it (early achievers)
+    p90_year: int | None = None  # Year when 90% of runs achieve it (late achievers)
 
 
 class MonteCarloResult(BaseModel):

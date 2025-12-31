@@ -1196,7 +1196,7 @@ def final_net_worth_histogram(
     result: MonteCarloResult,
     bins: int = 30,
 ) -> go.Figure:
-    """Create a histogram of final net worth distribution.
+    """Create a histogram of net worth distribution at end of simulation.
 
     Args:
         result: Monte Carlo simulation result
@@ -1207,12 +1207,19 @@ def final_net_worth_histogram(
     """
     values = result.final_net_worth_distribution
 
+    # Get the final year/age from snapshots for the title
+    final_snapshot = result.snapshots[-1] if result.snapshots else None
+    if final_snapshot:
+        title = f"Net Worth at Age {final_snapshot.age} ({final_snapshot.year})"
+    else:
+        title = "Net Worth Distribution (End of Simulation)"
+
     fig = go.Figure()
 
     fig.add_trace(go.Histogram(
         x=values,
         nbinsx=bins,
-        name='Final Net Worth',
+        name='Net Worth',
         marker=dict(
             color='#2E86AB',
             line=dict(color='#1a5276', width=1),
@@ -1226,20 +1233,20 @@ def final_net_worth_histogram(
     p90 = float(np.percentile(values, 90))
 
     for val, label, color in [
-        (p10, '10th percentile', '#DC3545'),
+        (p10, '10th', '#DC3545'),
         (p50, 'Median', '#28A745'),
-        (p90, '90th percentile', '#17A2B8'),
+        (p90, '90th', '#17A2B8'),
     ]:
         fig.add_vline(
             x=val,
             line_dash="dash",
             line_color=color,
-            annotation_text=f"{label}: ${val:,.0f}",
+            annotation_text=f"{label}: ${val/1_000_000:.1f}M",
             annotation_position="top",
         )
 
     fig.update_layout(
-        title="Final Net Worth Distribution",
+        title=title,
         xaxis_title="Net Worth",
         yaxis_title="Frequency",
         xaxis_tickprefix="$",
@@ -1252,11 +1259,13 @@ def final_net_worth_histogram(
 
 def milestone_probability_chart(
     result: MonteCarloResult,
+    use_target_probability: bool = True,
 ) -> go.Figure:
-    """Create a chart showing milestone probabilities.
+    """Create a chart showing milestone probabilities by retirement age.
 
     Args:
         result: Monte Carlo simulation result
+        use_target_probability: If True, show probability by target retirement age
 
     Returns:
         Plotly figure with milestone probabilities
@@ -1265,21 +1274,40 @@ def milestone_probability_chart(
 
     fig = go.Figure()
 
+    # Use probability_by_target if available and requested
+    def get_prob(m):
+        if use_target_probability and m.probability_by_target is not None:
+            return m.probability_by_target
+        return m.probability
+
     # Bar chart for probabilities
     colors = []
     for m in milestones:
-        if m.probability > 0.7:
+        prob = get_prob(m)
+        if prob > 0.7:
             colors.append('#28A745')  # Green
-        elif m.probability > 0.3:
+        elif prob > 0.3:
             colors.append('#FFC107')  # Yellow
         else:
             colors.append('#DC3545')  # Red
 
+    # Build labels with target values
+    labels = []
+    for m in milestones:
+        if m.milestone == "fire_number":
+            labels.append("FIRE")
+        elif m.target_value:
+            labels.append(f"${m.target_value / 1_000_000:.0f}M")
+        else:
+            labels.append(m.milestone.replace('_', ' ').title())
+
+    probs = [get_prob(m) for m in milestones]
+
     fig.add_trace(go.Bar(
-        x=[m.milestone.replace('_', ' ').title() for m in milestones],
-        y=[m.probability * 100 for m in milestones],
+        x=labels,
+        y=[p * 100 for p in probs],
         marker_color=colors,
-        text=[f"{m.probability:.0%}" for m in milestones],
+        text=[f"{p:.0%}" for p in probs],
         textposition='outside',
         hovertemplate=(
             "%{x}<br>"
@@ -1288,8 +1316,15 @@ def milestone_probability_chart(
         ),
     ))
 
+    # Build title with target age if available
+    target_age = milestones[0].target_age if milestones else None
+    if target_age and use_target_probability:
+        title = f"Probability by Age {target_age}"
+    else:
+        title = "Milestone Probabilities"
+
     fig.update_layout(
-        title="Milestone Achievement Probabilities",
+        title=title,
         xaxis_title="Milestone",
         yaxis_title="Probability (%)",
         yaxis_range=[0, 105],
@@ -1301,22 +1336,369 @@ def milestone_probability_chart(
 
 def milestone_timing_table(
     result: MonteCarloResult,
+    birth_year: int | None = None,
 ) -> pd.DataFrame:
     """Create a DataFrame showing milestone timing statistics.
 
     Args:
         result: Monte Carlo simulation result
+        birth_year: Birth year to convert years to ages (optional)
 
     Returns:
         DataFrame with milestone timing data
     """
+    def year_to_age(year: int | None) -> str:
+        if year is None:
+            return '-'
+        if birth_year:
+            return f"Age {year - birth_year}"
+        return str(year)
+
+    def format_range(p10: int | None, p90: int | None) -> str:
+        if p10 is None or p90 is None:
+            return '-'
+        if birth_year:
+            return f"Ages {p10 - birth_year}-{p90 - birth_year}"
+        return f"{p10}-{p90}"
+
     data = []
     for m in result.milestone_probabilities:
+        # Use probability_by_target if available (by retirement age)
+        prob = m.probability_by_target if m.probability_by_target is not None else m.probability
+
+        # Build milestone label
+        if m.milestone == "fire_number":
+            label = "FIRE (25x expenses)"
+        elif m.target_value:
+            label = f"${m.target_value / 1_000_000:.0f}M Net Worth"
+        else:
+            label = m.milestone.replace('_', ' ').title()
+
         data.append({
-            'Milestone': m.milestone.replace('_', ' ').title(),
-            'Probability': f"{m.probability:.0%}",
-            '10th Percentile Year': str(m.p10_year) if m.p10_year else '-',
-            'Median Year': str(m.median_year) if m.median_year else '-',
-            '90th Percentile Year': str(m.p90_year) if m.p90_year else '-',
+            'Milestone': label,
+            f'Prob by Age {m.target_age}' if m.target_age else 'Probability': f"{prob:.0%}",
+            'Typical Range': format_range(m.p10_year, m.p90_year),
+            'Median': year_to_age(m.median_year),
         })
+    return pd.DataFrame(data)
+
+
+# =============================================================================
+# Sensitivity Analysis Charts
+# =============================================================================
+
+
+def tornado_chart(
+    result: "TornadoResult",
+    color_positive: str = "#28A745",
+    color_negative: str = "#DC3545",
+) -> go.Figure:
+    """Create a tornado chart showing variable sensitivity.
+
+    Args:
+        result: TornadoResult from sensitivity analysis
+        color_positive: Color for positive impacts
+        color_negative: Color for negative impacts
+
+    Returns:
+        Plotly figure with tornado chart
+    """
+    from futurebucks.sensitivity import TornadoResult  # Avoid circular import
+
+    fig = go.Figure()
+
+    # Sort by impact (already sorted, but ensure order)
+    sensitivities = sorted(result.sensitivities, key=lambda x: x.impact, reverse=True)
+
+    labels = []
+    low_deltas = []
+    high_deltas = []
+
+    for sens in sensitivities:
+        labels.append(sens.variable_label)
+        # Calculate delta from base
+        low_deltas.append(sens.low_result - sens.base_result)
+        high_deltas.append(sens.high_result - sens.base_result)
+
+    # Determine if metric is something where higher is better (net worth) or lower is better (fire year)
+    # For net worth: positive delta = good (green), negative delta = bad (red)
+    # For fire year: positive delta = bad (red, later FIRE), negative delta = good (green, earlier FIRE)
+    is_lower_better = result.metric_name == "fire_year"
+
+    def get_bar_color(delta: float) -> str:
+        """Get color based on whether outcome is better or worse than baseline."""
+        if is_lower_better:
+            # Lower is better (fire_year) - negative delta is good
+            return color_positive if delta < 0 else color_negative
+        else:
+            # Higher is better (net_worth) - positive delta is good
+            return color_positive if delta > 0 else color_negative
+
+    # Create bar traces for low and high values
+    # Low value bars (extend left from base)
+    fig.add_trace(go.Bar(
+        y=labels,
+        x=low_deltas,
+        orientation='h',
+        name='Low (-20%)',
+        marker_color=[get_bar_color(d) for d in low_deltas],
+        customdata=[
+            f"${abs(d):,.0f}" if result.metric_name == "final_net_worth" else f"{abs(d):.1f}"
+            for d in low_deltas
+        ],
+        hovertemplate=(
+            "%{y}<br>"
+            "Low setting impact: %{customdata}<br>"
+            "<extra></extra>"
+        ),
+    ))
+
+    # High value bars (extend right from base)
+    fig.add_trace(go.Bar(
+        y=labels,
+        x=high_deltas,
+        orientation='h',
+        name='High (+20%)',
+        marker_color=[get_bar_color(d) for d in high_deltas],
+        customdata=[
+            f"${abs(d):,.0f}" if result.metric_name == "final_net_worth" else f"{abs(d):.1f}"
+            for d in high_deltas
+        ],
+        hovertemplate=(
+            "%{y}<br>"
+            "High setting impact: %{customdata}<br>"
+            "<extra></extra>"
+        ),
+    ))
+
+    # Add vertical line at base value
+    fig.add_vline(x=0, line_dash="solid", line_color="black", line_width=2)
+
+    # Format x-axis label based on metric
+    if result.metric_name == "final_net_worth":
+        xaxis_title = "Impact on Final Net Worth"
+        xaxis_tickprefix = "$"
+    elif result.metric_name == "fire_year":
+        xaxis_title = "Impact on FIRE Year"
+        xaxis_tickprefix = ""
+    else:
+        xaxis_title = f"Impact on {result.metric_name.replace('_', ' ').title()}"
+        xaxis_tickprefix = ""
+
+    fig.update_layout(
+        title=f"Sensitivity Analysis: {result.metric_name.replace('_', ' ').title()}",
+        xaxis_title=xaxis_title,
+        yaxis_title="Variable",
+        xaxis_tickprefix=xaxis_tickprefix,
+        barmode='overlay',
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=max(400, len(sensitivities) * 35 + 100),  # Dynamic height
+    )
+
+    # Reverse y-axis so highest impact is at top
+    fig.update_yaxes(autorange="reversed")
+
+    return fig
+
+
+def sensitivity_heatmap(
+    result: "WhatIfMatrix",
+    colorscale: str = "RdYlGn",
+) -> go.Figure:
+    """Create a heatmap showing what-if analysis results.
+
+    Args:
+        result: WhatIfMatrix from sensitivity analysis
+        colorscale: Plotly colorscale name
+
+    Returns:
+        Plotly figure with heatmap
+    """
+    from futurebucks.sensitivity import WhatIfMatrix  # Avoid circular import
+
+    # Build 2D matrix from cells
+    n_rows = len(result.variable2_values)
+    n_cols = len(result.variable1_values)
+
+    # Create matrix
+    z_matrix = np.zeros((n_rows, n_cols))
+    cell_lookup = {(c.var1_value, c.var2_value): c.result for c in result.cells}
+
+    for i, v2 in enumerate(result.variable2_values):
+        for j, v1 in enumerate(result.variable1_values):
+            z_matrix[i, j] = cell_lookup.get((v1, v2), result.base_result)
+
+    # Format axis labels
+    def format_value(v):
+        if abs(v) >= 1000:
+            return f"${v/1000:.0f}K" if v > 0 else f"-${abs(v)/1000:.0f}K"
+        elif abs(v) < 1:
+            return f"{v:.1%}"
+        else:
+            return f"{v:.0f}"
+
+    x_labels = [format_value(v) for v in result.variable1_values]
+    y_labels = [format_value(v) for v in result.variable2_values]
+
+    # Reverse colorscale for fire_year (lower is better)
+    if result.metric_name == "fire_year":
+        colorscale = "RdYlGn_r"
+
+    fig = go.Figure(data=go.Heatmap(
+        z=z_matrix,
+        x=x_labels,
+        y=y_labels,
+        colorscale=colorscale,
+        colorbar=dict(
+            title=result.metric_name.replace("_", " ").title(),
+            tickprefix="$" if result.metric_name == "final_net_worth" else "",
+        ),
+        hovertemplate=(
+            f"{result.variable1_label}: %{{x}}<br>"
+            f"{result.variable2_label}: %{{y}}<br>"
+            f"Result: $%{{z:,.0f}}<extra></extra>"
+            if result.metric_name == "final_net_worth" else
+            f"{result.variable1_label}: %{{x}}<br>"
+            f"{result.variable2_label}: %{{y}}<br>"
+            f"Result: %{{z}}<extra></extra>"
+        ),
+    ))
+
+    fig.update_layout(
+        title=f"What-If Analysis: {result.metric_name.replace('_', ' ').title()}",
+        xaxis_title=result.variable1_label,
+        yaxis_title=result.variable2_label,
+        template="plotly_white",
+    )
+
+    return fig
+
+
+def spider_chart(
+    results: list["SensitivityResult"],
+    metric_name: str = "final_net_worth",
+) -> go.Figure:
+    """Create a spider/radar chart showing relative sensitivity.
+
+    Args:
+        results: List of SensitivityResult from tornado analysis
+        metric_name: Name of the metric being analyzed
+
+    Returns:
+        Plotly figure with spider chart
+    """
+    from futurebucks.sensitivity import SensitivityResult  # Avoid circular import
+
+    if not results:
+        fig = go.Figure()
+        fig.add_annotation(text="No data available", x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    # Take top N results (max 8 for readability)
+    results = sorted(results, key=lambda x: x.impact, reverse=True)[:8]
+
+    # Calculate relative impacts (normalize to 0-100 scale)
+    max_impact = max(r.impact for r in results) if results else 1
+    normalized_impacts = [r.impact / max_impact * 100 for r in results]
+
+    labels = [r.variable_label for r in results]
+
+    # Close the spider by repeating first point
+    labels_closed = labels + [labels[0]]
+    impacts_closed = normalized_impacts + [normalized_impacts[0]]
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatterpolar(
+        r=impacts_closed,
+        theta=labels_closed,
+        fill='toself',
+        name='Impact',
+        fillcolor='rgba(46, 134, 171, 0.3)',
+        line=dict(color='#2E86AB', width=2),
+        hovertemplate=(
+            "%{theta}<br>"
+            "Relative Impact: %{r:.1f}%<br>"
+            "<extra></extra>"
+        ),
+    ))
+
+    # Add markers for each point
+    fig.add_trace(go.Scatterpolar(
+        r=normalized_impacts,
+        theta=labels,
+        mode='markers',
+        marker=dict(size=10, color='#2E86AB'),
+        showlegend=False,
+        customdata=[
+            f"${r.impact:,.0f}" if metric_name == "final_net_worth" else f"{r.impact:.2f}"
+            for r in results
+        ],
+        hovertemplate=(
+            "%{theta}<br>"
+            "Actual Impact: %{customdata}<br>"
+            "<extra></extra>"
+        ),
+    ))
+
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(
+                visible=True,
+                range=[0, 105],
+                ticksuffix="%",
+            ),
+        ),
+        title=f"Sensitivity Spider Chart: {metric_name.replace('_', ' ').title()}",
+        showlegend=False,
+        template="plotly_white",
+    )
+
+    return fig
+
+
+def sensitivity_summary_table(
+    results: list["SensitivityResult"],
+    metric_name: str = "final_net_worth",
+) -> pd.DataFrame:
+    """Create a summary DataFrame of sensitivity results.
+
+    Args:
+        results: List of SensitivityResult from tornado analysis
+        metric_name: Name of the metric being analyzed
+
+    Returns:
+        DataFrame with sensitivity summary
+    """
+    from futurebucks.sensitivity import SensitivityResult  # Avoid circular import
+
+    data = []
+    for r in results:
+        if metric_name == "final_net_worth":
+            base_fmt = f"${r.base_result:,.0f}"
+            low_fmt = f"${r.low_result:,.0f}"
+            high_fmt = f"${r.high_result:,.0f}"
+            impact_fmt = f"${r.impact:,.0f}"
+        elif metric_name == "fire_year":
+            base_fmt = f"{int(r.base_result)}"
+            low_fmt = f"{int(r.low_result)}"
+            high_fmt = f"{int(r.high_result)}"
+            impact_fmt = f"{r.impact:.1f} years"
+        else:
+            base_fmt = f"{r.base_result:.2f}"
+            low_fmt = f"{r.low_result:.2f}"
+            high_fmt = f"{r.high_result:.2f}"
+            impact_fmt = f"{r.impact:.2f}"
+
+        data.append({
+            "Variable": r.variable_label,
+            "Base Value": f"{r.base_value:,.2f}" if r.base_value < 100 else f"{r.base_value:,.0f}",
+            "Low (-20%)": r.low_value,
+            "High (+20%)": r.high_value,
+            f"Result at Low": low_fmt,
+            f"Result at High": high_fmt,
+            "Impact": impact_fmt,
+        })
+
     return pd.DataFrame(data)

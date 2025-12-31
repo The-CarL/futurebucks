@@ -26,7 +26,12 @@ from futurebucks.charts import (
     final_net_worth_histogram,
     milestone_probability_chart,
     milestone_timing_table,
+    tornado_chart,
+    sensitivity_heatmap,
+    spider_chart,
+    sensitivity_summary_table,
 )
+from futurebucks.sensitivity import SensitivityAnalyzer, run_sensitivity_analysis
 
 
 st.set_page_config(
@@ -63,6 +68,10 @@ def init_session_state():
         st.session_state.mc_enabled = False
     if "mc_num_sims" not in st.session_state:
         st.session_state.mc_num_sims = 500
+    if "sensitivity_result" not in st.session_state:
+        st.session_state.sensitivity_result = None
+    if "what_if_result" not in st.session_state:
+        st.session_state.what_if_result = None
 
 
 def sidebar():
@@ -155,10 +164,10 @@ def sidebar():
         st.session_state.mc_num_sims = st.sidebar.slider(
             "Number of simulations",
             min_value=100,
-            max_value=2000,
+            max_value=15000,
             value=st.session_state.mc_num_sims,
             step=100,
-            help="More simulations = more accurate results but slower",
+            help="More simulations = more accurate results but slower (10k+ recommended for detailed analysis)",
         )
 
     st.sidebar.divider()
@@ -534,29 +543,48 @@ def tab_monte_carlo():
 
     # Milestone Probabilities
     st.subheader("Milestone Probabilities")
+    retirement_age = scenario.person.retirement_age
+    st.caption(f"Showing probability of reaching milestones by retirement age {retirement_age}")
 
     for prob in mc_result.milestone_probabilities:
-        label = prob.milestone.replace("_", " ").title()
-        if prob.target_value:
-            label = f"{label} (${prob.target_value / 1_000_000:.0f}M)"
+        # Build milestone label
+        if prob.milestone == "fire_number":
+            label = "FIRE (25x expenses)"
+        else:
+            label = prob.milestone.replace("_", " ").title()
+            if prob.target_value:
+                label = f"{label} (${prob.target_value / 1_000_000:.0f}M)"
+
+        # Use probability_by_target as primary metric (by retirement age)
+        display_prob = prob.probability_by_target if prob.probability_by_target is not None else prob.probability
 
         col1, col2 = st.columns([3, 1])
         with col1:
-            # Color based on probability
-            if prob.probability >= 0.7:
-                color = "green"
-            elif prob.probability >= 0.3:
-                color = "orange"
+            # Show probability by retirement age
+            if prob.target_age and prob.probability_by_target is not None:
+                progress_text = f"{label} by age {prob.target_age}: **{display_prob:.0%}**"
             else:
-                color = "red"
+                progress_text = f"{label}: **{display_prob:.0%}**"
 
-            st.progress(prob.probability, text=f"{label}: **{prob.probability:.0%}**")
+            st.progress(display_prob, text=progress_text)
+
         with col2:
-            if prob.median_year:
-                age = prob.median_year - scenario.person.birth_year
-                st.caption(f"Median: {prob.median_year} (age {age})")
+            # Show when it's likely achieved (range)
+            if prob.p10_year and prob.p90_year:
+                p10_age = prob.p10_year - scenario.person.birth_year
+                p90_age = prob.p90_year - scenario.person.birth_year
+                median_age = prob.median_year - scenario.person.birth_year if prob.median_year else None
+
+                if p10_age == p90_age:
+                    st.caption(f"Typically age {p10_age}")
+                elif median_age:
+                    st.caption(f"Ages {p10_age}-{p90_age} (median {median_age})")
+                else:
+                    st.caption(f"Ages {p10_age}-{p90_age}")
+            elif prob.probability == 0:
+                st.caption("Not reached")
             else:
-                st.caption("Not typically reached")
+                st.caption("—")
 
     st.divider()
 
@@ -575,8 +603,344 @@ def tab_monte_carlo():
 
     # Detailed timing table
     with st.expander("Milestone Timing Details"):
-        timing_df = milestone_timing_table(mc_result)
-        st.dataframe(timing_df, width="stretch", hide_index=True)
+        timing_df = milestone_timing_table(mc_result, birth_year=scenario.person.birth_year)
+        st.dataframe(timing_df, use_container_width=True, hide_index=True)
+
+
+def tab_sensitivity():
+    """Render the Sensitivity Analysis tab."""
+    st.subheader("Sensitivity Analysis")
+
+    if not st.session_state.loaded_scenario:
+        st.info("Load a scenario from the sidebar to run sensitivity analysis.")
+        return
+
+    scenario = st.session_state.loaded_scenario
+
+    # Controls
+    st.markdown("Analyze which variables have the most impact on your financial outcomes.")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        target_metric = st.selectbox(
+            "Target Metric",
+            ["final_net_worth", "fire_year", "final_savings_rate"],
+            format_func=lambda x: {
+                "final_net_worth": "Final Net Worth",
+                "fire_year": "FIRE Year",
+                "final_savings_rate": "Final Savings Rate",
+            }.get(x, x),
+            help="The metric to analyze sensitivity for",
+        )
+
+    with col2:
+        variation_pct = st.slider(
+            "Variation %",
+            min_value=5,
+            max_value=50,
+            value=20,
+            step=5,
+            help="How much to vary each parameter (e.g., ±20%)",
+        ) / 100
+
+    with col3:
+        top_n = st.slider(
+            "Top Variables",
+            min_value=5,
+            max_value=15,
+            value=10,
+            help="Number of top variables to show",
+        )
+
+    # Run Tornado Analysis
+    if st.button("Run Tornado Analysis", type="primary"):
+        with st.spinner("Running sensitivity analysis... This may take a moment."):
+            progress_bar = st.progress(0)
+
+            def update_progress(completed, total):
+                progress_bar.progress(completed / total)
+
+            try:
+                result = run_sensitivity_analysis(
+                    scenario=scenario,
+                    target_metric=target_metric,
+                    variation_pct=variation_pct,
+                    top_n=top_n,
+                    progress_callback=update_progress,
+                )
+                st.session_state.sensitivity_result = result
+                progress_bar.empty()
+                st.success(f"Analysis complete! Analyzed {len(result.sensitivities)} variables.")
+            except Exception as e:
+                st.error(f"Error running analysis: {e}")
+
+    # Display results
+    if st.session_state.sensitivity_result:
+        result = st.session_state.sensitivity_result
+
+        st.divider()
+
+        # Summary
+        col1, col2 = st.columns([2, 1])
+
+        with col1:
+            st.markdown(f"**Base {result.metric_name.replace('_', ' ').title()}:** ")
+            if result.metric_name == "final_net_worth":
+                st.markdown(f"### {format_currency(result.base_value)}")
+            elif result.metric_name == "fire_year":
+                st.markdown(f"### {int(result.base_value)}")
+            else:
+                st.markdown(f"### {result.base_value:.2%}")
+
+        with col2:
+            # Top impact variable
+            if result.sensitivities:
+                top_var = result.sensitivities[0]
+                st.markdown("**Most Impactful Variable:**")
+                st.markdown(f"**{top_var.variable_label}**")
+
+        st.divider()
+
+        # Tornado Chart
+        st.subheader("Tornado Chart")
+        st.caption("Shows how varying each input affects the outcome. Longer bars = more impact.")
+        st.plotly_chart(tornado_chart(result), use_container_width=True)
+
+        # Spider Chart
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("Spider Chart")
+            st.caption("Relative impact of each variable (normalized to 100%)")
+            st.plotly_chart(
+                spider_chart(result.sensitivities, result.metric_name),
+                use_container_width=True,
+            )
+
+        with col2:
+            st.subheader("Key Insights")
+            st.markdown("**Top 5 Most Impactful Variables:**")
+
+            for i, sens in enumerate(result.sensitivities[:5], 1):
+                # Determine direction
+                if sens.high_result > sens.low_result:
+                    direction = "Higher values increase outcome"
+                else:
+                    direction = "Higher values decrease outcome"
+
+                if result.metric_name == "final_net_worth":
+                    impact_str = format_currency(sens.impact)
+                elif result.metric_name == "fire_year":
+                    impact_str = f"{sens.impact:.1f} years"
+                else:
+                    impact_str = f"{sens.impact:.2%}"
+
+                st.markdown(f"{i}. **{sens.variable_label}**: ±{impact_str}")
+                st.caption(f"   {direction}")
+
+        # Detailed Table
+        with st.expander("View Detailed Results"):
+            df = sensitivity_summary_table(result.sensitivities, result.metric_name)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # What-If Analysis Section
+    st.subheader("What-If Analysis")
+    st.caption("Explore how two variables interact by creating a heatmap of outcomes.")
+
+    # Build dynamic variable list from the actual scenario
+    available_vars = []
+
+    # Add income sources with actual names and values
+    for i, source in enumerate(scenario.income_sources):
+        available_vars.append((
+            f"income_sources[{i}].amount",
+            f"Income: {source.name} (${source.amount:,.0f}/yr)",
+        ))
+        # Also add growth rate
+        growth_rate = source.growth_rate.mean if hasattr(source.growth_rate, 'mean') else source.growth_rate
+        available_vars.append((
+            f"income_sources[{i}].growth_rate",
+            f"Income Growth: {source.name} ({growth_rate:.1%}/yr)",
+        ))
+
+    # Add assets with actual names and values
+    for i, asset in enumerate(scenario.assets):
+        available_vars.append((
+            f"assets[{i}].balance",
+            f"Asset: {asset.name} (${asset.balance:,.0f})",
+        ))
+        exp_return = asset.expected_return.mean if hasattr(asset.expected_return, 'mean') else asset.expected_return
+        available_vars.append((
+            f"assets[{i}].expected_return",
+            f"Return Rate: {asset.name} ({exp_return:.1%}/yr)",
+        ))
+
+    # Add expenses with actual names and values
+    for i, expense in enumerate(scenario.expenses):
+        available_vars.append((
+            f"expenses[{i}].amount",
+            f"Expense: {expense.name} (${expense.amount:,.0f}/yr)",
+        ))
+
+    # Add assumptions
+    available_vars.append((
+        "assumptions.state_tax_rate",
+        f"State Tax Rate ({scenario.assumptions.state_tax_rate:.1%})",
+    ))
+    general_inflation = scenario.assumptions.get_inflation_rate("general").mean
+    available_vars.append((
+        "assumptions.inflation_rates.general",
+        f"General Inflation Rate ({general_inflation:.1%}/yr)",
+    ))
+
+    # Add simulation config
+    available_vars.append((
+        "simulation_years",
+        f"Simulation Years ({scenario.simulation_years} years)",
+    ))
+
+    # Initialize analyzer
+    analyzer = SensitivityAnalyzer(scenario)
+
+    # Initialize variables with defaults
+    var1_min, var1_max, var1_steps = 0.0, 1.0, 5
+    var2_min, var2_max, var2_steps = 0.0, 1.0, 5
+    can_run_what_if = False
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        var1_idx = st.selectbox(
+            "Variable 1 (X-axis)",
+            range(len(available_vars)),
+            format_func=lambda i: available_vars[i][1],
+        )
+        var1_path, var1_label = available_vars[var1_idx]
+
+        # Get current value to set default range
+        # Tuple format: (resolved_path, current_value, is_distribution, item_name)
+        resolved1 = analyzer._resolve_path(var1_path)
+        if resolved1:
+            base_val1 = resolved1[0][1]  # current_value is at index 1
+            if base_val1 != 0:
+                var1_min = st.number_input(
+                    f"{var1_label} Min",
+                    value=float(base_val1 * 0.5),
+                    format="%.2f",
+                )
+                var1_max = st.number_input(
+                    f"{var1_label} Max",
+                    value=float(base_val1 * 1.5),
+                    format="%.2f",
+                )
+            else:
+                var1_min = st.number_input(f"{var1_label} Min", value=0.0, format="%.2f")
+                var1_max = st.number_input(f"{var1_label} Max", value=1.0, format="%.2f")
+            var1_steps = st.slider("Steps", min_value=3, max_value=10, value=5, key="var1_steps")
+            can_run_what_if = True
+        else:
+            st.warning(f"Could not resolve path: {var1_path}")
+
+    with col2:
+        # Default to a different variable than var1 if possible
+        default_var2_idx = min(1, len(available_vars) - 1) if len(available_vars) > 1 else 0
+        # Try to pick an asset if var1 is income, or vice versa
+        if var1_idx < len(available_vars):
+            var1_type = available_vars[var1_idx][1].split(":")[0] if ":" in available_vars[var1_idx][1] else ""
+            for i, (_, label) in enumerate(available_vars):
+                if i != var1_idx and ":" in label and label.split(":")[0] != var1_type:
+                    default_var2_idx = i
+                    break
+
+        var2_idx = st.selectbox(
+            "Variable 2 (Y-axis)",
+            range(len(available_vars)),
+            format_func=lambda i: available_vars[i][1],
+            index=default_var2_idx,
+        )
+        var2_path, var2_label = available_vars[var2_idx]
+
+        # Tuple format: (resolved_path, current_value, is_distribution, item_name)
+        resolved2 = analyzer._resolve_path(var2_path)
+        if resolved2:
+            base_val2 = resolved2[0][1]  # current_value is at index 1
+            if base_val2 != 0:
+                var2_min = st.number_input(
+                    f"{var2_label} Min",
+                    value=float(base_val2 * 0.5),
+                    format="%.2f",
+                )
+                var2_max = st.number_input(
+                    f"{var2_label} Max",
+                    value=float(base_val2 * 1.5),
+                    format="%.2f",
+                )
+            else:
+                var2_min = st.number_input(f"{var2_label} Min", value=0.0, format="%.2f")
+                var2_max = st.number_input(f"{var2_label} Max", value=1.0, format="%.2f")
+            var2_steps = st.slider("Steps", min_value=3, max_value=10, value=5, key="var2_steps")
+        else:
+            st.warning(f"Could not resolve path: {var2_path}")
+            can_run_what_if = False
+
+    what_if_metric = st.selectbox(
+        "What-If Target Metric",
+        ["final_net_worth", "fire_year"],
+        format_func=lambda x: {
+            "final_net_worth": "Final Net Worth",
+            "fire_year": "FIRE Year",
+        }.get(x, x),
+        key="what_if_metric",
+    )
+
+    if st.button("Run What-If Analysis", disabled=not can_run_what_if):
+        with st.spinner(f"Running what-if analysis ({var1_steps * var2_steps} simulations)..."):
+            progress_bar = st.progress(0)
+
+            def update_progress(completed, total):
+                progress_bar.progress(completed / total)
+
+            # Extract clean labels for axis (remove the current value in parentheses)
+            # "Income: Primary Job ($120,000/yr)" -> "Income: Primary Job"
+            def clean_label(label: str) -> str:
+                if "(" in label:
+                    return label.split("(")[0].strip()
+                return label
+
+            try:
+                what_if_result = analyzer.run_what_if_matrix(
+                    variable1_path=var1_path,
+                    variable1_range=(var1_min, var1_max, var1_steps),
+                    variable2_path=var2_path,
+                    variable2_range=(var2_min, var2_max, var2_steps),
+                    target_metric=what_if_metric,
+                    progress_callback=update_progress,
+                    variable1_label=clean_label(var1_label),
+                    variable2_label=clean_label(var2_label),
+                )
+                st.session_state.what_if_result = what_if_result
+                progress_bar.empty()
+                st.success("What-if analysis complete!")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    # Display what-if results
+    if st.session_state.what_if_result:
+        what_if_result = st.session_state.what_if_result
+
+        st.plotly_chart(
+            sensitivity_heatmap(what_if_result),
+            use_container_width=True,
+        )
+
+        st.caption(
+            f"Heatmap shows {what_if_result.metric_name.replace('_', ' ').title()} "
+            f"for different combinations of {what_if_result.variable1_label} and {what_if_result.variable2_label}. "
+            f"Green = better outcomes, Red = worse outcomes."
+        )
 
 
 def main():
@@ -593,7 +957,7 @@ def main():
         st.caption("Life-event-driven financial simulation tool")
 
     # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["Results", "Monte Carlo", "Editor", "Comparison"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Results", "Monte Carlo", "Sensitivity", "Editor", "Comparison"])
 
     with tab1:
         if st.session_state.simulation_result:
@@ -605,9 +969,12 @@ def main():
         tab_monte_carlo()
 
     with tab3:
-        tab_editor()
+        tab_sensitivity()
 
     with tab4:
+        tab_editor()
+
+    with tab5:
         tab_comparison()
 
 
