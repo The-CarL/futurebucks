@@ -3,7 +3,7 @@
 import streamlit as st
 import pandas as pd
 
-from futurebucks.models import SimulationResult
+from futurebucks.models import SimulationResult, MonteCarloConfig, MonteCarloResult
 from futurebucks.scenarios import (
     list_scenarios,
     list_sample_scenarios,
@@ -14,6 +14,7 @@ from futurebucks.scenarios import (
     yaml_to_scenario,
 )
 from futurebucks.simulation import run_simulation
+from futurebucks.monte_carlo import run_monte_carlo
 from futurebucks.charts import (
     net_worth_chart,
     income_expenses_chart,
@@ -21,6 +22,10 @@ from futurebucks.charts import (
     tax_breakdown_chart,
     comparison_chart,
     savings_rate_chart,
+    monte_carlo_fan_chart,
+    final_net_worth_histogram,
+    milestone_probability_chart,
+    milestone_timing_table,
 )
 
 
@@ -52,6 +57,12 @@ def init_session_state():
         st.session_state.comparison_results = []
     if "yaml_editor_content" not in st.session_state:
         st.session_state.yaml_editor_content = ""
+    if "mc_result" not in st.session_state:
+        st.session_state.mc_result = None
+    if "mc_enabled" not in st.session_state:
+        st.session_state.mc_enabled = False
+    if "mc_num_sims" not in st.session_state:
+        st.session_state.mc_num_sims = 500
 
 
 def sidebar():
@@ -95,6 +106,15 @@ def sidebar():
             # Run simulation immediately
             result = run_simulation(scenario)
             st.session_state.simulation_result = result
+
+            # Run Monte Carlo if enabled
+            if st.session_state.mc_enabled:
+                config = MonteCarloConfig(num_simulations=st.session_state.mc_num_sims)
+                mc_result = run_monte_carlo(scenario, config)
+                st.session_state.mc_result = mc_result
+            else:
+                st.session_state.mc_result = None
+
             st.sidebar.success(f"Loaded: {scenario.name}")
         except Exception as e:
             st.sidebar.error(f"Error loading scenario: {e}")
@@ -120,6 +140,26 @@ def sidebar():
                 st.sidebar.error(f"Error with {filename}: {e}")
         st.session_state.comparison_results = results
         st.sidebar.success(f"Loaded {len(results)} scenarios for comparison")
+
+    st.sidebar.divider()
+
+    # Monte Carlo settings
+    st.sidebar.subheader("Monte Carlo")
+    st.session_state.mc_enabled = st.sidebar.toggle(
+        "Enable Monte Carlo",
+        value=st.session_state.mc_enabled,
+        help="Run multiple simulations with stochastic parameters",
+    )
+
+    if st.session_state.mc_enabled:
+        st.session_state.mc_num_sims = st.sidebar.slider(
+            "Number of simulations",
+            min_value=100,
+            max_value=2000,
+            value=st.session_state.mc_num_sims,
+            step=100,
+            help="More simulations = more accurate results but slower",
+        )
 
     st.sidebar.divider()
 
@@ -445,6 +485,100 @@ def tab_comparison():
     )
 
 
+def tab_monte_carlo():
+    """Render the Monte Carlo results tab."""
+    st.subheader("Monte Carlo Analysis")
+
+    if not st.session_state.mc_result:
+        if not st.session_state.mc_enabled:
+            st.info("Enable Monte Carlo in the sidebar and reload a scenario to see probabilistic analysis.")
+        else:
+            st.info("Load a scenario to run Monte Carlo simulation.")
+        return
+
+    mc_result: MonteCarloResult = st.session_state.mc_result
+    scenario = st.session_state.loaded_scenario
+
+    # Summary metrics
+    st.markdown(f"**{mc_result.num_simulations} simulations run**")
+
+    final_snapshot = mc_result.snapshots[-1]
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric(
+            "10th Percentile",
+            format_currency(final_snapshot.net_worth_p10),
+            help="Pessimistic outcome - only 10% of simulations ended lower",
+        )
+    with col2:
+        st.metric(
+            "Median (50th)",
+            format_currency(final_snapshot.net_worth_p50),
+            help="Middle outcome - half ended higher, half lower",
+        )
+    with col3:
+        st.metric(
+            "90th Percentile",
+            format_currency(final_snapshot.net_worth_p90),
+            help="Optimistic outcome - only 10% of simulations ended higher",
+        )
+    with col4:
+        st.metric(
+            "Mean ± Std Dev",
+            format_currency(final_snapshot.net_worth_mean),
+            f"± {format_currency(final_snapshot.net_worth_stddev)}",
+        )
+
+    st.divider()
+
+    # Milestone Probabilities
+    st.subheader("Milestone Probabilities")
+
+    for prob in mc_result.milestone_probabilities:
+        label = prob.milestone.replace("_", " ").title()
+        if prob.target_value:
+            label = f"{label} (${prob.target_value / 1_000_000:.0f}M)"
+
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            # Color based on probability
+            if prob.probability >= 0.7:
+                color = "green"
+            elif prob.probability >= 0.3:
+                color = "orange"
+            else:
+                color = "red"
+
+            st.progress(prob.probability, text=f"{label}: **{prob.probability:.0%}**")
+        with col2:
+            if prob.median_year:
+                age = prob.median_year - scenario.person.birth_year
+                st.caption(f"Median: {prob.median_year} (age {age})")
+            else:
+                st.caption("Not typically reached")
+
+    st.divider()
+
+    # Fan Chart
+    st.subheader("Net Worth Projections")
+    st.plotly_chart(monte_carlo_fan_chart(mc_result), use_container_width=True)
+
+    # Histogram and Milestone Chart side by side
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.plotly_chart(final_net_worth_histogram(mc_result), use_container_width=True)
+
+    with col2:
+        st.plotly_chart(milestone_probability_chart(mc_result), use_container_width=True)
+
+    # Detailed timing table
+    with st.expander("Milestone Timing Details"):
+        timing_df = milestone_timing_table(mc_result)
+        st.dataframe(timing_df, width="stretch", hide_index=True)
+
+
 def main():
     """Main application entry point."""
     init_session_state()
@@ -459,7 +593,7 @@ def main():
         st.caption("Life-event-driven financial simulation tool")
 
     # Tabs
-    tab1, tab2, tab3 = st.tabs(["Results", "Editor", "Comparison"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Results", "Monte Carlo", "Editor", "Comparison"])
 
     with tab1:
         if st.session_state.simulation_result:
@@ -468,9 +602,12 @@ def main():
             st.info("Load and run a scenario to see results.")
 
     with tab2:
-        tab_editor()
+        tab_monte_carlo()
 
     with tab3:
+        tab_editor()
+
+    with tab4:
         tab_comparison()
 
 

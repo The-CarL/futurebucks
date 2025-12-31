@@ -72,8 +72,16 @@ def _calculate_gross_income(
     income_sources: list[IncomeSource],
     year: int,
     start_year: int,
+    growth_rate_overrides: dict[str, float] | None = None,
 ) -> float:
-    """Calculate total gross income for a year."""
+    """Calculate total gross income for a year.
+
+    Args:
+        income_sources: List of income sources
+        year: Current year
+        start_year: Simulation start year
+        growth_rate_overrides: Optional dict of source_name -> growth_rate for Monte Carlo
+    """
     total = 0.0
     for source in income_sources:
         if not _is_active(source, year):
@@ -82,7 +90,14 @@ def _calculate_gross_income(
         # Calculate years of growth since income started
         source_start = source.start_year or start_year
         years_active = max(0, year - source_start)
-        amount = source.amount * ((1 + source.growth_rate) ** years_active)
+
+        # Use override if provided, otherwise use mean from Distribution
+        if growth_rate_overrides and source.name in growth_rate_overrides:
+            growth_rate = growth_rate_overrides[source.name]
+        else:
+            growth_rate = float(source.growth_rate.mean)
+
+        amount = source.amount * ((1 + growth_rate) ** years_active)
         total += amount
 
     return total
@@ -323,13 +338,25 @@ def _apply_returns(
     assets: dict[str, float],
     asset_configs: list[Asset],
     default_return: float,
+    return_overrides: dict[str, float] | None = None,
 ) -> dict[str, float]:
-    """Apply investment returns to all assets."""
+    """Apply investment returns to all assets.
+
+    Args:
+        assets: Current asset balances
+        asset_configs: Asset configurations
+        default_return: Default return rate for unknown assets
+        return_overrides: Optional dict of asset_name -> return for Monte Carlo
+    """
     config_by_name = {a.name: a for a in asset_configs}
 
     for name in assets:
-        if name in config_by_name:
-            expected_return = config_by_name[name].expected_return
+        # Use override if provided
+        if return_overrides and name in return_overrides:
+            expected_return = return_overrides[name]
+        elif name in config_by_name:
+            # Use mean from Distribution
+            expected_return = float(config_by_name[name].expected_return.mean)
         else:
             expected_return = default_return
 
@@ -412,7 +439,8 @@ def run_simulation(scenario: Scenario) -> SimulationResult:
     }
 
     cumulative_taxes = 0.0
-    inflation_rate = scenario.assumptions.inflation_rate
+    # Extract mean from Distribution for deterministic simulation
+    inflation_rate = float(scenario.assumptions.inflation_rate.mean)
 
     for year in range(current_year, end_year + 1):
         age = year - scenario.person.birth_year

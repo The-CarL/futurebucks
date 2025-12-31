@@ -130,7 +130,7 @@ class TestExpenseCalculation:
         first_expenses = result.snapshots[0].total_expenses
         second_expenses = result.snapshots[1].total_expenses
 
-        inflation_rate = basic_scenario.assumptions.inflation_rate
+        inflation_rate = basic_scenario.assumptions.inflation_rate.mean
         expected = first_expenses * (1 + inflation_rate)
         assert second_expenses == pytest.approx(expected, rel=0.01)
 

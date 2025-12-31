@@ -1,0 +1,417 @@
+================================================================================
+FUTUREBUCKS TECHNICAL SUMMARY
+Financial Simulation Engine Design Document
+================================================================================
+
+PURPOSE
+-------
+FutureBucks is a life-event-driven financial simulation tool that projects
+household net worth over time, accounting for income, expenses, taxes,
+investment returns, and major life events. It includes Monte Carlo simulation
+for probabilistic analysis of outcomes.
+
+================================================================================
+ARCHITECTURE OVERVIEW
+================================================================================
+
+Core Components:
+  - models.py        : Pydantic data models for all configuration and state
+  - simulation.py    : Deterministic year-by-year simulation engine
+  - monte_carlo.py   : Stochastic simulation with sampling
+  - tax_engine.py    : Federal, state, and FICA tax calculations
+  - charts.py        : Plotly visualizations
+  - app.py           : Streamlit web interface
+  - scenarios.py     : YAML scenario loading/saving
+
+================================================================================
+DATA MODELS
+================================================================================
+
+Distribution (Stochastic Parameters)
+------------------------------------
+Supports three distribution types for Monte Carlo:
+  - normal:    Standard normal distribution (default)
+  - lognormal: Lognormal distribution (always positive, good for returns)
+  - uniform:   Uniform distribution between min and max
+
+Fields:
+  - type: "normal" | "lognormal" | "uniform"
+  - mean: float (central tendency)
+  - stddev: float (volatility, default 0.0)
+  - min/max: float (for uniform distribution)
+
+YAML format supports both scalar and distribution syntax:
+  expected_return: 0.07                              # Scalar (stddev=0)
+  expected_return: {mean: 0.07, stddev: 0.15}        # Normal distribution
+  expected_return: {type: lognormal, mean: 0.07, stddev: 0.15}
+
+Scenario Configuration
+----------------------
+Person:
+  - birth_year: int
+  - retirement_age: int (default 65)
+
+IncomeSource:
+  - amount: float (annual, pre-tax)
+  - growth_rate: Distribution (annual raise %)
+  - start_year/end_year: optional bounds
+
+Asset:
+  - type: "taxable" | "401k" | "roth_ira" | "traditional_ira" | "hsa" |
+          "real_estate" | "other"
+  - balance: float (current value)
+  - expected_return: Distribution (annual return %)
+
+Expense:
+  - amount: float (annual)
+  - inflation_adjusted: bool
+  - start_year/end_year: optional bounds
+
+LifeEvent (types):
+  - income_change: Modify income source amount/growth
+  - expense_change: Modify expense amount
+  - windfall: One-time cash infusion (inheritance, bonus, etc.)
+  - asset_purchase: Buy asset (home, etc.) funded from another asset
+  - child: Add child-related expenses with end_year
+  - retirement: Trigger retirement logic
+
+Assumptions:
+  - inflation_rate: Distribution (default mean=0.025)
+  - market_return_mean: float (default 0.07)
+  - market_return_stddev: float (default 0.15)
+  - state_tax_rate: float (flat state income tax rate)
+
+================================================================================
+SIMULATION ENGINE (simulation.py)
+================================================================================
+
+Year-by-Year Processing
+-----------------------
+For each year from current_year to current_year + simulation_years:
+
+1. INFLATION ADJUSTMENT
+   - All tax brackets, contribution limits, and deductions are inflated
+   - Formula: adjusted_value = base_value * (1 + inflation_rate)^years_from_base
+   - Base year: 2024
+
+2. LIFE EVENT APPLICATION
+   - Process all life events scheduled for this year
+   - Modify income_sources, expenses, and assets accordingly
+   - Windfalls are added to gross_income for tax purposes
+
+3. INCOME CALCULATION
+   - Sum all active income sources
+   - Apply growth: amount * (1 + growth_rate)^years_active
+   - Add any windfall amounts
+
+4. EXPENSE CALCULATION
+   - Sum all active expenses
+   - If inflation_adjusted: amount * (1 + inflation_rate)^years
+
+5. PRE-TAX DEDUCTION ESTIMATION
+   - Estimate 401k contributions based on available savings
+   - Estimate HSA contributions
+   - These reduce taxable income
+
+6. TAX CALCULATION (see Tax Engine section)
+   - Federal income tax (progressive brackets)
+   - State income tax (flat rate)
+   - FICA taxes (Social Security + Medicare)
+
+7. SAVINGS CALCULATION
+   - savings = gross_income - total_tax - total_expenses
+   - Negative savings = drawing from taxable accounts
+
+8. ASSET ALLOCATION
+   Priority order for positive savings:
+   a) 401k (up to limit, including catch-up if age >= 50)
+   b) HSA (up to limit if available)
+   c) Roth IRA (income phase-out applies)
+   d) Traditional IRA (if Roth not available)
+   e) Taxable brokerage (remainder)
+
+9. INVESTMENT RETURNS
+   - Apply expected_return to each asset
+   - Formula: new_balance = balance * (1 + return_rate)
+
+10. MILESTONE TRACKING
+    - Check net worth thresholds: $100K, $500K, $1M, $2M, $3M, $5M, $10M, etc.
+    - Check FIRE milestone: net_worth * 0.04 >= annual_expenses
+    - Record year when each milestone is first achieved
+
+================================================================================
+TAX ENGINE (tax_engine.py)
+================================================================================
+
+Federal Income Tax (2024 MFJ Brackets)
+--------------------------------------
+Brackets are inflation-adjusted each year:
+  $0 - $23,200:        10%
+  $23,200 - $94,300:   12%
+  $94,300 - $201,050:  22%
+  $201,050 - $383,900: 24%
+  $383,900 - $487,450: 32%
+  $487,450 - $731,200: 35%
+  $731,200+:           37%
+
+Calculation:
+  taxable_income = gross_income - pre_tax_deductions - standard_deduction
+  federal_tax = sum of marginal taxes across brackets
+
+State Income Tax
+----------------
+Flat rate applied to taxable income (configurable per scenario).
+Default: 5% (North Carolina rate)
+
+FICA Taxes
+----------
+Social Security:
+  - Rate: 6.2% employee + 6.2% employer (12.4% total for self-employed)
+  - Wage cap: $168,600 (2024, inflation-adjusted)
+  - Calculation: min(gross_income, ss_wage_cap) * 0.062
+
+Medicare:
+  - Rate: 1.45% employee + 1.45% employer
+  - No wage cap
+  - Additional Medicare Tax: 0.9% on income over $250,000 (MFJ)
+  - Calculation: gross_income * 0.0145 + max(0, gross_income - 250000) * 0.009
+
+Total Tax
+---------
+total_tax = federal_tax + state_tax + fica_tax
+
+Capital Gains Tax (for future withdrawals)
+------------------------------------------
+Long-term (held > 1 year):
+  0% if taxable_income <= $94,050
+  15% if taxable_income <= $583,750
+  20% if taxable_income > $583,750
+
+Short-term: Taxed as ordinary income
+
+================================================================================
+CONTRIBUTION LIMITS (2024, Inflation-Adjusted)
+================================================================================
+
+401(k):
+  - Base limit: $23,000
+  - Catch-up (age 50+): $7,500 additional
+  - Total max: $30,500
+
+IRA (Traditional & Roth):
+  - Base limit: $7,000
+  - Catch-up (age 50+): $1,000 additional
+
+Roth IRA Income Phase-out (MFJ):
+  - Phase-out begins: $230,000 MAGI
+  - Phase-out ends: $240,000 MAGI
+  - Linear reduction in contribution limit
+
+HSA (Family coverage):
+  - Limit: $8,300
+
+================================================================================
+MONTE CARLO SIMULATION (monte_carlo.py)
+================================================================================
+
+Purpose
+-------
+Run N simulations (default 1000) with stochastic parameters to generate
+probability distributions of outcomes.
+
+Stochastic Parameters
+---------------------
+Each simulation samples independent values for each year:
+  1. Inflation rate (per year)
+  2. Asset returns (per asset, per year)
+  3. Income growth rates (per source, per year)
+
+Default Volatility (when YAML uses scalar values)
+-------------------------------------------------
+If a parameter has stddev=0, defaults are applied:
+  - Asset returns: Use market_return_stddev from assumptions (default 15%)
+  - Real estate: 5% stddev
+  - Income growth: 2% stddev
+  - Inflation: 1% stddev
+
+SampledScenario Class
+---------------------
+Pre-samples all stochastic values before running simulation:
+  - inflation_samples[year_index] -> float
+  - asset_return_samples[asset_name][year_index] -> float
+  - income_growth_samples[source_name][year_index] -> float
+
+Aggregation
+-----------
+After running N simulations, results are aggregated:
+  - Percentiles: 10th, 25th, 50th (median), 75th, 90th
+  - Mean and standard deviation
+  - Per-year snapshots for time series visualization
+
+Milestone Probabilities
+-----------------------
+For each milestone (e.g., net worth $1M):
+  - probability = count(simulations that achieved) / total_simulations
+  - median_year = median of years when achieved (if achieved)
+  - p10_year, p90_year = timing range
+
+Dynamic Milestone Selection
+---------------------------
+Higher milestones ($10M, $20M, $50M) are included in output when the
+median final net worth exceeds those thresholds.
+
+Reproducibility
+---------------
+Seed-based random number generation using numpy.random.Generator.
+Same seed produces identical results.
+
+================================================================================
+FIRE CALCULATION
+================================================================================
+
+FIRE Number
+-----------
+Based on the 4% safe withdrawal rate (Trinity Study).
+FIRE achieved when: net_worth * 0.04 >= annual_expenses
+
+This implies: FIRE_target = 25 * annual_expenses
+
+FIRE Expense Basis Options
+--------------------------
+  - "max": Maximum expenses across all simulated years
+  - "first_year": Expenses in year 1
+  - "current": Current year's expenses (recalculated each year)
+  - "target": User-specified target expense amount
+
+================================================================================
+KEY ASSUMPTIONS AND LIMITATIONS
+================================================================================
+
+Assumptions:
+  1. Tax brackets and limits inflate at the same rate as general inflation
+  2. Investment returns are applied after savings allocation each year
+  3. All income sources are treated as ordinary income (no capital gains distinction on income)
+  4. Employer 401k match is not modeled separately
+  5. Social Security benefits not modeled (could be added as income source)
+  6. Required Minimum Distributions (RMDs) not modeled
+  7. Asset rebalancing not modeled
+  8. Tax-loss harvesting not modeled
+
+Limitations:
+  1. Single filing status not fully supported (uses MFJ brackets)
+  2. No state-specific tax brackets (flat rate only)
+  3. No AMT (Alternative Minimum Tax) calculation
+  4. No estate tax modeling
+  5. Inflation is applied uniformly (no category-specific inflation)
+  6. Real estate appreciation is simplified (no mortgage amortization)
+  7. Healthcare costs before Medicare not modeled separately
+
+================================================================================
+OUTPUT METRICS
+================================================================================
+
+Per-Year Snapshot (YearlySnapshot):
+  - year, age
+  - gross_income, net_income
+  - federal_tax, state_tax, fica_tax, total_tax
+  - total_expenses, savings
+  - assets (dict of asset_name -> balance)
+  - net_worth (sum of all assets)
+  - cumulative_taxes_paid
+
+Simulation Result (SimulationResult):
+  - scenario_name
+  - snapshots: list[YearlySnapshot]
+  - milestones: dict[milestone_name -> year_achieved or None]
+  - fire_target_expenses
+
+Monte Carlo Result (MonteCarloResult):
+  - num_simulations
+  - snapshots: list[MonteCarloSnapshot] (aggregated percentiles per year)
+  - milestone_probabilities: list[MilestoneProbability]
+  - final_net_worth_distribution: list[float] (raw values for histogram)
+
+================================================================================
+VISUALIZATION
+================================================================================
+
+Charts (Plotly):
+  1. Net Worth Over Time - Line chart with life event markers
+  2. Income vs Expenses - Stacked area chart
+  3. Asset Allocation - Stacked area chart by asset type
+  4. Tax Breakdown - Stacked bar chart (federal, state, FICA)
+  5. Savings Rate - Line chart of savings/income ratio
+  6. Monte Carlo Fan Chart - Percentile bands (10-90, 25-75) with median
+  7. Final Net Worth Histogram - Distribution with percentile markers
+  8. Milestone Probability Chart - Bar chart with probability percentages
+
+================================================================================
+FILE STRUCTURE
+================================================================================
+
+src/futurebucks/
+  ├── __init__.py
+  ├── app.py           # Streamlit UI
+  ├── charts.py        # Plotly visualizations
+  ├── models.py        # Pydantic data models
+  ├── monte_carlo.py   # Monte Carlo simulation
+  ├── scenarios.py     # YAML loading/saving
+  ├── simulation.py    # Deterministic simulation
+  └── tax_engine.py    # Tax calculations
+
+scenarios/             # User scenario YAML files
+samples/               # Example scenario templates
+tests/                 # Pytest test suite
+
+================================================================================
+EXAMPLE YAML SCENARIO
+================================================================================
+
+name: "Example Scenario"
+description: "A sample financial scenario"
+
+person:
+  name: "John & Jane"
+  birth_year: 1990
+  retirement_age: 60
+
+income_sources:
+  - name: "Primary Job"
+    amount: 150000
+    growth_rate: {mean: 0.03, stddev: 0.02}  # 3% avg, 2% volatility
+
+assets:
+  - name: "401k"
+    type: "401k"
+    balance: 200000
+    expected_return: {mean: 0.07, stddev: 0.15}  # 7% avg, 15% volatility
+  - name: "Taxable"
+    type: "taxable"
+    balance: 50000
+    expected_return: 0.07  # Uses market_return_stddev from assumptions
+
+expenses:
+  - name: "Living Expenses"
+    amount: 60000
+    inflation_adjusted: true
+
+life_events:
+  - name: "First Child"
+    year: 2028
+    type: "child"
+    details:
+      name: "Child expenses"
+      annual_cost: 20000
+      end_year: 2046
+
+assumptions:
+  inflation_rate: {mean: 0.025, stddev: 0.01}
+  market_return_mean: 0.07
+  market_return_stddev: 0.15
+  state_tax_rate: 0.05
+
+simulation_years: 30
+
+================================================================================
+END OF TECHNICAL SUMMARY
+================================================================================

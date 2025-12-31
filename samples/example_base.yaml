@@ -9,21 +9,21 @@ person:
 income_sources:
   - name: "Primary Job"
     amount: 55000
-    growth_rate: 0.03
+    growth_rate: {mean: 0.03, stddev: 0.02}  # Distribution for Monte Carlo
 
 assets:
   - name: "Savings Account"
     type: "taxable"
     balance: 5000
-    expected_return: 0.04
+    expected_return: 0.04  # Stable savings rate
   - name: "401k"
     type: "401k"
     balance: 15000
-    expected_return: 0.07
+    expected_return: {mean: 0.07, stddev: 0.15}  # Stock market volatility
   - name: "Roth IRA"
     type: "roth_ira"
     balance: 3000
-    expected_return: 0.07
+    expected_return: {mean: 0.07, stddev: 0.15}  # Stock market volatility
 
 expenses:
   - name: "Rent & Utilities"
@@ -59,7 +59,7 @@ life_events:
       end_year: 2046
 
 assumptions:
-  inflation_rate: 0.025
+  inflation_rate: {mean: 0.025, stddev: 0.01}  # Inflation uncertainty
   market_return_mean: 0.07
   market_return_stddev: 0.15
   state: "NC"

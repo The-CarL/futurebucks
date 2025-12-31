@@ -5,7 +5,8 @@ from plotly.subplots import make_subplots
 import altair as alt
 import pandas as pd
 
-from futurebucks.models import SimulationResult
+from futurebucks.models import SimulationResult, MonteCarloResult
+import numpy as np
 
 
 def format_currency(value: float) -> str:
@@ -1063,3 +1064,259 @@ def altair_synced_dashboard(
     )
 
     return combined
+
+
+def monte_carlo_fan_chart(
+    result: MonteCarloResult,
+    show_median: bool = True,
+    show_mean: bool = False,
+) -> go.Figure:
+    """Create a fan chart showing percentile bands over time.
+
+    Args:
+        result: Monte Carlo simulation result
+        show_median: Show the 50th percentile line
+        show_mean: Show the mean line
+
+    Returns:
+        Plotly figure with fan chart
+    """
+    years = [s.year for s in result.snapshots]
+    ages = [s.age for s in result.snapshots]
+
+    fig = go.Figure()
+
+    # Add separate traces for each percentile boundary line
+    # P90 line (top of outer band)
+    fig.add_trace(go.Scatter(
+        x=years,
+        y=[s.net_worth_p90 for s in result.snapshots],
+        mode='lines',
+        line=dict(color='rgba(46, 134, 171, 0.3)', width=1),
+        name='90th percentile',
+        showlegend=False,
+        hovertemplate="90th: $%{y:,.0f}<extra></extra>",
+    ))
+
+    # P10 line (bottom of outer band)
+    fig.add_trace(go.Scatter(
+        x=years,
+        y=[s.net_worth_p10 for s in result.snapshots],
+        mode='lines',
+        fill='tonexty',
+        fillcolor='rgba(46, 134, 171, 0.15)',
+        line=dict(color='rgba(46, 134, 171, 0.3)', width=1),
+        name='10th-90th percentile',
+        hovertemplate="10th: $%{y:,.0f}<extra></extra>",
+    ))
+
+    # P75 line (top of inner band)
+    fig.add_trace(go.Scatter(
+        x=years,
+        y=[s.net_worth_p75 for s in result.snapshots],
+        mode='lines',
+        line=dict(color='rgba(46, 134, 171, 0.5)', width=1),
+        name='75th percentile',
+        showlegend=False,
+        hovertemplate="75th: $%{y:,.0f}<extra></extra>",
+    ))
+
+    # P25 line (bottom of inner band)
+    fig.add_trace(go.Scatter(
+        x=years,
+        y=[s.net_worth_p25 for s in result.snapshots],
+        mode='lines',
+        fill='tonexty',
+        fillcolor='rgba(46, 134, 171, 0.3)',
+        line=dict(color='rgba(46, 134, 171, 0.5)', width=1),
+        name='25th-75th percentile',
+        hovertemplate="25th: $%{y:,.0f}<extra></extra>",
+    ))
+
+    # Median line
+    if show_median:
+        fig.add_trace(go.Scatter(
+            x=years,
+            y=[s.net_worth_p50 for s in result.snapshots],
+            mode='lines',
+            name='Median (50th)',
+            line=dict(color='#2E86AB', width=3),
+            customdata=ages,
+            hovertemplate=(
+                "Year: %{x}<br>"
+                "Age: %{customdata}<br>"
+                "Median Net Worth: $%{y:,.0f}<extra></extra>"
+            ),
+        ))
+
+    # Mean line (optional)
+    if show_mean:
+        fig.add_trace(go.Scatter(
+            x=years,
+            y=[s.net_worth_mean for s in result.snapshots],
+            mode='lines',
+            name='Mean',
+            line=dict(color='#A23B72', width=2, dash='dash'),
+            hovertemplate="Mean: $%{y:,.0f}<extra></extra>",
+        ))
+
+    # Add percentile annotations at end
+    last_snap = result.snapshots[-1]
+    annotations_y = [
+        (last_snap.net_worth_p90, "90th", "#2E86AB"),
+        (last_snap.net_worth_p50, "50th", "#2E86AB"),
+        (last_snap.net_worth_p10, "10th", "#2E86AB"),
+    ]
+
+    for y_val, label, color in annotations_y:
+        fig.add_annotation(
+            x=years[-1],
+            y=y_val,
+            text=f"{label}: ${y_val:,.0f}",
+            showarrow=False,
+            xanchor='left',
+            xshift=10,
+            font=dict(size=10, color=color),
+        )
+
+    fig.update_layout(
+        title=f"Net Worth Projection ({result.num_simulations} simulations)",
+        xaxis_title="Year",
+        yaxis_title="Net Worth",
+        yaxis_tickprefix="$",
+        hovermode="x unified",
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+
+    return fig
+
+
+def final_net_worth_histogram(
+    result: MonteCarloResult,
+    bins: int = 30,
+) -> go.Figure:
+    """Create a histogram of final net worth distribution.
+
+    Args:
+        result: Monte Carlo simulation result
+        bins: Number of histogram bins
+
+    Returns:
+        Plotly figure with histogram
+    """
+    values = result.final_net_worth_distribution
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Histogram(
+        x=values,
+        nbinsx=bins,
+        name='Final Net Worth',
+        marker=dict(
+            color='#2E86AB',
+            line=dict(color='#1a5276', width=1),
+        ),
+        opacity=0.85,
+    ))
+
+    # Add vertical lines for key percentiles
+    p50 = float(np.percentile(values, 50))
+    p10 = float(np.percentile(values, 10))
+    p90 = float(np.percentile(values, 90))
+
+    for val, label, color in [
+        (p10, '10th percentile', '#DC3545'),
+        (p50, 'Median', '#28A745'),
+        (p90, '90th percentile', '#17A2B8'),
+    ]:
+        fig.add_vline(
+            x=val,
+            line_dash="dash",
+            line_color=color,
+            annotation_text=f"{label}: ${val:,.0f}",
+            annotation_position="top",
+        )
+
+    fig.update_layout(
+        title="Final Net Worth Distribution",
+        xaxis_title="Net Worth",
+        yaxis_title="Frequency",
+        xaxis_tickprefix="$",
+        template="plotly_white",
+        bargap=0.05,
+    )
+
+    return fig
+
+
+def milestone_probability_chart(
+    result: MonteCarloResult,
+) -> go.Figure:
+    """Create a chart showing milestone probabilities.
+
+    Args:
+        result: Monte Carlo simulation result
+
+    Returns:
+        Plotly figure with milestone probabilities
+    """
+    milestones = result.milestone_probabilities
+
+    fig = go.Figure()
+
+    # Bar chart for probabilities
+    colors = []
+    for m in milestones:
+        if m.probability > 0.7:
+            colors.append('#28A745')  # Green
+        elif m.probability > 0.3:
+            colors.append('#FFC107')  # Yellow
+        else:
+            colors.append('#DC3545')  # Red
+
+    fig.add_trace(go.Bar(
+        x=[m.milestone.replace('_', ' ').title() for m in milestones],
+        y=[m.probability * 100 for m in milestones],
+        marker_color=colors,
+        text=[f"{m.probability:.0%}" for m in milestones],
+        textposition='outside',
+        hovertemplate=(
+            "%{x}<br>"
+            "Probability: %{y:.1f}%<br>"
+            "<extra></extra>"
+        ),
+    ))
+
+    fig.update_layout(
+        title="Milestone Achievement Probabilities",
+        xaxis_title="Milestone",
+        yaxis_title="Probability (%)",
+        yaxis_range=[0, 105],
+        template="plotly_white",
+    )
+
+    return fig
+
+
+def milestone_timing_table(
+    result: MonteCarloResult,
+) -> pd.DataFrame:
+    """Create a DataFrame showing milestone timing statistics.
+
+    Args:
+        result: Monte Carlo simulation result
+
+    Returns:
+        DataFrame with milestone timing data
+    """
+    data = []
+    for m in result.milestone_probabilities:
+        data.append({
+            'Milestone': m.milestone.replace('_', ' ').title(),
+            'Probability': f"{m.probability:.0%}",
+            '10th Percentile Year': str(m.p10_year) if m.p10_year else '-',
+            'Median Year': str(m.median_year) if m.median_year else '-',
+            '90th Percentile Year': str(m.p90_year) if m.p90_year else '-',
+        })
+    return pd.DataFrame(data)
