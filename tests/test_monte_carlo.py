@@ -31,6 +31,7 @@ def basic_scenario():
             name="Test User",
             birth_year=1990,
             retirement_age=65,
+            life_expectancy=46,  # age 36 + 10 years of simulation
         ),
         income_sources=[
             IncomeSource(
@@ -64,7 +65,6 @@ def basic_scenario():
         assumptions=Assumptions(
             inflation_rate={"mean": 0.025, "stddev": 0.01},
         ),
-        simulation_years=10,
     )
 
 
@@ -254,6 +254,7 @@ class TestBackwardCompatibility:
                 name="Test User",
                 birth_year=1990,
                 retirement_age=65,
+                life_expectancy=41,  # age 36 + 5 years of simulation
             ),
             income_sources=[
                 IncomeSource(
@@ -281,7 +282,6 @@ class TestBackwardCompatibility:
             assumptions=Assumptions(
                 inflation_rate=0.025,  # Scalar - will get default 1% stddev
             ),
-            simulation_years=5,
         )
 
         config = MonteCarloConfig(num_simulations=10, seed=42)

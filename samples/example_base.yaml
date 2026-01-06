@@ -68,5 +68,3 @@ assumptions:
   contribution_401k_limit: 23000
   contribution_ira_limit: 7000
   contribution_hsa_limit: 4150
-
-simulation_years: 30

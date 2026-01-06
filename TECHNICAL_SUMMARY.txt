@@ -87,7 +87,7 @@ SIMULATION ENGINE (simulation.py)
 
 Year-by-Year Processing
 -----------------------
-For each year from current_year to current_year + simulation_years:
+For each year from start_year through life_expectancy (simulation_years computed automatically):
 
 1. INFLATION ADJUSTMENT
    - All tax brackets, contribution limits, and deductions are inflated
@@ -374,6 +374,7 @@ person:
   name: "John & Jane"
   birth_year: 1990
   retirement_age: 60
+  life_expectancy: 95  # Simulation runs through life expectancy
 
 income_sources:
   - name: "Primary Job"
@@ -409,8 +410,6 @@ assumptions:
   market_return_mean: 0.07
   market_return_stddev: 0.15
   state_tax_rate: 0.05
-
-simulation_years: 30
 
 ================================================================================
 END OF TECHNICAL SUMMARY

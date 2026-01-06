@@ -227,13 +227,115 @@ def tab_results(result: SimulationResult):
     # Key Milestones
     st.subheader("Key Milestones")
 
-    # FIRE milestone highlight
+    # FIRE Analysis
     fire_year = result.milestones.get("fire_number")
-    retirement_year = result.milestones.get("retirement_ready")
+    target_fire_age = scenario.person.retirement_age
+    target_fire_year = scenario.person.birth_year + target_fire_age
+    life_expectancy = scenario.person.life_expectancy
 
-    if fire_year:
+    # Calculate IRS retirement age from target retirement age perspective
+    years_until_irs_from_target = scenario.assumptions.get_years_until_irs_access(target_fire_age)
+    effective_irs_age = target_fire_age + years_until_irs_from_target
+
+    # Bridge period: target retirement to IRS access
+    bridge_years = max(0, effective_irs_age - target_fire_age)
+
+    # Post-IRS period: IRS access to life expectancy
+    post_irs_years = max(0, life_expectancy - effective_irs_age)
+
+    # Find expenses at target retirement age
+    target_snapshot = None
+    for s in result.snapshots:
+        if s.year >= target_fire_year:
+            target_snapshot = s
+            break
+    if target_snapshot is None:
+        target_snapshot = last_snapshot
+
+    annual_expenses = target_snapshot.total_expenses
+
+    # Calculate FIRE requirements
+    bridge_funding_needed = annual_expenses * bridge_years
+
+    # Post-IRS: Use 4% SWR (25x) if 30+ years, otherwise simple multiplication
+    if post_irs_years >= 30:
+        post_irs_multiplier = 25  # 4% SWR
+        swr_note = "4% SWR"
+    else:
+        # For shorter periods, can use higher SWR, but be conservative
+        # Use ~5% for 20 years, ~6% for 15 years, but cap at simple years calc
+        post_irs_multiplier = min(25, post_irs_years * 1.1)  # 10% buffer for sequence risk
+        swr_note = f"{post_irs_years:.0f}yr + 10% buffer"
+
+    post_irs_funding_needed = annual_expenses * post_irs_multiplier
+
+    # Balances at target age
+    accessible_at_target = target_snapshot.accessible_net_worth
+    retirement_at_target = target_snapshot.net_worth - accessible_at_target
+
+    # Estimate retirement account growth during bridge (assuming 7% real return)
+    avg_return = scenario.assumptions.market_return_mean
+    retirement_at_irs_age = retirement_at_target * ((1 + avg_return) ** bridge_years)
+
+    # Display FIRE status
+    if fire_year and fire_year <= target_fire_year:
         fire_age = fire_year - scenario.person.birth_year
-        st.success(f"**FIRE Achieved: {fire_year} (Age {fire_age})** - Your investments can cover your expenses with a 4% withdrawal rate!")
+        st.success(f"**FIRE Achieved by Target: {fire_year} (Age {fire_age})** - You hit FIRE before your target retirement age of {target_fire_age}!")
+    elif fire_year:
+        fire_age = fire_year - scenario.person.birth_year
+        st.warning(f"**FIRE Achieved: {fire_year} (Age {fire_age})** - This is {fire_age - target_fire_age} years after your target retirement age of {target_fire_age}.")
+    else:
+        st.error(f"**FIRE Not Achieved** - You don't reach FIRE during the simulation period.")
+
+    # FIRE Expense Breakdown
+    with st.expander("FIRE Requirements Breakdown", expanded=True):
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            st.metric("Target FIRE Age", f"{target_fire_age}")
+            st.caption(f"Year {target_fire_year}")
+
+        with col2:
+            st.metric("IRS Access Age", f"{effective_irs_age:.1f}")
+            st.caption("401k/IRA/HSA unlock")
+
+        with col3:
+            st.metric("Life Expectancy", f"{life_expectancy}")
+            st.caption("Planning horizon")
+
+        with col4:
+            total_retirement_years = life_expectancy - target_fire_age
+            st.metric("Retirement Years", f"{total_retirement_years:.0f}")
+            st.caption(f"Bridge: {bridge_years:.1f} + Post-IRS: {post_irs_years:.0f}")
+
+        st.divider()
+
+        st.markdown(f"**Annual Expenses at Age {target_fire_age}:** {format_currency(annual_expenses)}")
+
+        req_col1, req_col2 = st.columns(2)
+
+        with req_col1:
+            st.markdown(f"**Phase 1: Bridge Period** (Age {target_fire_age} → {effective_irs_age:.0f})")
+            st.markdown(f"- Duration: {bridge_years:.1f} years")
+            st.markdown(f"- Funding Needed: {format_currency(bridge_funding_needed)}")
+            st.markdown(f"- Taxable Available: {format_currency(accessible_at_target)}")
+            bridge_status = "✅" if accessible_at_target >= bridge_funding_needed else "❌"
+            if accessible_at_target >= bridge_funding_needed:
+                st.markdown(f"- Status: {bridge_status} Covered (surplus: {format_currency(accessible_at_target - bridge_funding_needed)})")
+            else:
+                st.markdown(f"- Status: {bridge_status} Shortfall: {format_currency(bridge_funding_needed - accessible_at_target)}")
+
+        with req_col2:
+            st.markdown(f"**Phase 2: Post-IRS** (Age {effective_irs_age:.0f} → {life_expectancy})")
+            st.markdown(f"- Duration: {post_irs_years:.0f} years ({swr_note})")
+            st.markdown(f"- Funding Needed: {format_currency(post_irs_funding_needed)}")
+            st.markdown(f"- Retirement at FIRE: {format_currency(retirement_at_target)}")
+            st.markdown(f"- Projected at IRS Age: {format_currency(retirement_at_irs_age)} (after {bridge_years:.1f}yr growth)")
+            post_status = "✅" if retirement_at_irs_age >= post_irs_funding_needed else "❌"
+            if retirement_at_irs_age >= post_irs_funding_needed:
+                st.markdown(f"- Status: {post_status} Covered")
+            else:
+                st.markdown(f"- Status: {post_status} Shortfall: {format_currency(post_irs_funding_needed - retirement_at_irs_age)}")
 
     # Major milestones in columns
     milestone_cols = st.columns(4)
@@ -347,20 +449,28 @@ def tab_results(result: SimulationResult):
     with st.expander("View Yearly Details"):
         df_data = []
         for snapshot in result.snapshots:
+            # Get taxable brokerage balance
+            brokerage = next(
+                (v for k, v in snapshot.assets.items() if "brokerage" in k.lower()),
+                0.0
+            )
             df_data.append({
                 "Year": snapshot.year,
                 "Age": snapshot.age,
                 "Gross Income": f"${snapshot.gross_income:,.0f}",
+                "Income Tax": f"${snapshot.federal_tax + snapshot.state_tax + snapshot.fica_tax:,.0f}",
+                "Assets Sold": f"${snapshot.assets_sold:,.0f}",
+                "Cap Gains Tax": f"${snapshot.capital_gains_tax:,.0f}",
                 "Total Tax": f"${snapshot.total_tax:,.0f}",
-                "Net Income": f"${snapshot.net_income:,.0f}",
                 "Expenses": f"${snapshot.total_expenses:,.0f}",
                 "Savings": f"${snapshot.savings:,.0f}",
+                "Brokerage": f"${brokerage:,.0f}",
                 "Net Worth": f"${snapshot.net_worth:,.0f}",
             })
 
         st.dataframe(
             pd.DataFrame(df_data),
-            width="stretch",
+            use_container_width=True,
             hide_index=True,
         )
 
@@ -538,6 +648,56 @@ def tab_monte_carlo():
             format_currency(final_snapshot.net_worth_mean),
             f"± {format_currency(final_snapshot.net_worth_stddev)}",
         )
+
+    st.divider()
+
+    # FIRE Requirements Context
+    st.subheader("FIRE Requirements")
+
+    target_fire_age = scenario.person.retirement_age
+    life_expectancy = scenario.person.life_expectancy
+    years_until_irs_from_target = scenario.assumptions.get_years_until_irs_access(target_fire_age)
+    effective_irs_age = target_fire_age + years_until_irs_from_target
+    bridge_years = max(0, effective_irs_age - target_fire_age)
+    post_irs_years = max(0, life_expectancy - effective_irs_age)
+
+    # Find median expenses at target retirement year
+    target_fire_year = scenario.person.birth_year + target_fire_age
+    target_mc_snapshot = None
+    for s in mc_result.snapshots:
+        if s.year >= target_fire_year:
+            target_mc_snapshot = s
+            break
+    if target_mc_snapshot is None:
+        target_mc_snapshot = mc_result.snapshots[-1]
+
+    median_expenses = target_mc_snapshot.total_expenses_median
+    bridge_funding_needed = median_expenses * bridge_years
+
+    # Post-IRS multiplier based on years
+    if post_irs_years >= 30:
+        post_irs_multiplier = 25
+        swr_note = "4% SWR"
+    else:
+        post_irs_multiplier = min(25, post_irs_years * 1.1)
+        swr_note = f"{post_irs_years:.0f}yr + buffer"
+
+    post_irs_funding_needed = median_expenses * post_irs_multiplier
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Target FIRE Age", f"{target_fire_age}")
+    with col2:
+        st.metric("IRS Access Age", f"{effective_irs_age:.1f}")
+    with col3:
+        st.metric("Life Expectancy", f"{life_expectancy}")
+    with col4:
+        total_years = life_expectancy - target_fire_age
+        st.metric("Retirement Years", f"{total_years:.0f}")
+
+    st.markdown(f"**Median Annual Expenses at Age {target_fire_age}:** {format_currency(median_expenses)}")
+    st.markdown(f"- **Phase 1 - Bridge:** {format_currency(bridge_funding_needed)} ({bridge_years:.1f} years from taxable)")
+    st.markdown(f"- **Phase 2 - Post-IRS:** {format_currency(post_irs_funding_needed)} ({post_irs_years:.0f} years, {swr_note})")
 
     st.divider()
 

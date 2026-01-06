@@ -35,6 +35,7 @@ def basic_scenario():
             name="Test User",
             birth_year=1990,
             retirement_age=65,
+            life_expectancy=46,  # age 36 + 10 years of simulation
         ),
         income_sources=[
             IncomeSource(
@@ -66,7 +67,6 @@ def basic_scenario():
         ],
         life_events=[],
         assumptions=Assumptions(),
-        simulation_years=10,
     )
 
 
@@ -276,9 +276,9 @@ class TestSensitivityAnalyzer:
         analyzer = SensitivityAnalyzer(basic_scenario)
 
         # Tuple format: (resolved_path, current_value, is_distribution, item_name)
-        resolved = analyzer._resolve_path("simulation_years")
+        resolved = analyzer._resolve_path("start_year")
         assert len(resolved) == 1
-        assert resolved[0][1] == 10  # simulation_years value
+        assert resolved[0][1] == basic_scenario.start_year
 
     def test_resolve_path_nested(self, basic_scenario):
         """Should resolve nested paths."""
@@ -421,6 +421,7 @@ class TestIntegration:
                 name="Test User",
                 birth_year=1985,
                 retirement_age=60,
+                life_expectancy=61,  # age 41 + 20 years = 61
             ),
             income_sources=[
                 IncomeSource(
@@ -466,14 +467,13 @@ class TestIntegration:
                 use_conservative_defaults=False,
             ),
             life_events=[],
-            simulation_years=20,
         )
 
         result = run_simulation(scenario)
 
-        # Verify simulation completes
+        # Verify simulation completes (simulation_years computed from life_expectancy)
         assert result is not None
-        assert len(result.snapshots) == 21
+        assert len(result.snapshots) == scenario.simulation_years + 1
 
         # Verify net worth grows
         assert result.snapshots[-1].net_worth > result.snapshots[0].net_worth

@@ -40,6 +40,7 @@ person:
   name: "Your Name"
   birth_year: 1990
   retirement_age: 60
+  life_expectancy: 95  # Simulation runs through life expectancy
 
 income_sources:
   - name: "Primary Job"
@@ -74,8 +75,6 @@ assumptions:
   inflation_rate: 0.025
   market_return_mean: 0.07
   state_tax_rate: 0.05
-
-simulation_years: 30
 ```
 
 ## Life Event Types

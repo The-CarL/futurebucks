@@ -1,6 +1,5 @@
 """Monte Carlo simulation engine for financial projections."""
 
-from datetime import datetime
 from copy import deepcopy
 from typing import Callable
 
@@ -27,6 +26,7 @@ from futurebucks.simulation import (
     _apply_life_events,
     _allocate_savings,
     _apply_returns,
+    _rebalance_cash_to_investments,
     _calculate_pre_tax_deductions,
     _calculate_roth_ira_limit,
     _calculate_accessible_net_worth,
@@ -183,8 +183,9 @@ def run_simulation_with_samples(
     This is a modified version of run_simulation that uses sampled values
     instead of fixed means.
     """
-    current_year = datetime.now().year
-    end_year = current_year + scenario.simulation_years
+    start_year = scenario.start_year
+    end_year = start_year + scenario.simulation_years
+    retirement_year = scenario.person.birth_year + scenario.person.retirement_age
 
     # Initialize mutable state
     income_sources = deepcopy(scenario.income_sources)
@@ -209,9 +210,11 @@ def run_simulation_with_samples(
 
     cumulative_taxes = 0.0
 
-    for year_idx, year in enumerate(range(current_year, end_year + 1)):
+    for year_idx, year in enumerate(range(start_year, end_year + 1)):
         age = year - scenario.person.birth_year
         years_from_base = max(0, year - BASE_YEAR)
+        yearly_cap_gains_tax = 0.0  # Track capital gains tax for this year
+        yearly_assets_sold = 0.0  # Track assets sold to cover expenses
 
         # Get sampled inflation rates for this year (category-specific)
         general_inflation = sampled.get_inflation_rate(year_idx, "general")
@@ -265,7 +268,7 @@ def run_simulation_with_samples(
             assets=assets,
             events=scenario.life_events,
             inflation_rate=general_inflation,
-            start_year=current_year,
+            start_year=start_year,
         )
 
         # Build growth rate overrides from sampled values
@@ -274,20 +277,20 @@ def run_simulation_with_samples(
             for source in income_sources
         }
 
-        # Calculate income with sampled growth rates
+        # Calculate income with sampled growth rates (stops at retirement)
         gross_income = _calculate_gross_income(
-            income_sources, year, current_year, growth_rate_overrides
+            income_sources, year, start_year, retirement_year, growth_rate_overrides
         )
         gross_income += windfall
 
         # Calculate regular expenses with category-specific inflation
         total_expenses = _calculate_expenses(
-            expenses, year, current_year, general_inflation, inflation_rate_overrides
+            expenses, year, start_year, general_inflation, inflation_rate_overrides
         )
 
         # Add healthcare expenses with healthcare-specific inflation
         healthcare_expenses = _calculate_healthcare_expenses(
-            scenario, year, current_year, healthcare_inflation
+            scenario, year, start_year, healthcare_inflation
         )
         total_expenses += healthcare_expenses
 
@@ -334,14 +337,45 @@ def run_simulation_with_samples(
                 roth_phase_out_end=adjusted_roth_phase_out_end,
             )
         elif savings < 0:
-            # Draw from taxable account if spending exceeds income
+            # Draw from taxable accounts if spending exceeds income
+            # Account for capital gains taxes on sales
+            # Assume 50% of portfolio is gains (reasonable for long-term holdings)
+            # Use 15% LTCG rate (could be 0%, 15%, or 20% depending on income)
+            gain_fraction = 0.50
+            ltcg_rate = 0.15
+
+            needed = -savings
             for name, config in [(a.name, a) for a in scenario.assets]:
-                if config.type == "taxable" and name in assets:
-                    draw = min(-savings, assets[name])
-                    assets[name] -= draw
-                    savings += draw
-                    if savings >= 0:
-                        break
+                if config.type == "taxable" and name in assets and needed > 0:
+                    # Gross up withdrawal to cover taxes on gains
+                    # gross_sale = net_needed / (1 - tax_rate * gain_fraction)
+                    tax_drag = ltcg_rate * gain_fraction
+                    gross_needed = needed / (1 - tax_drag)
+
+                    # Don't withdraw more than available
+                    gross_draw = min(gross_needed, assets[name])
+                    assets[name] -= gross_draw
+                    yearly_assets_sold += gross_draw
+
+                    # Calculate actual tax on this sale
+                    cap_gains_tax = gross_draw * gain_fraction * ltcg_rate
+                    yearly_cap_gains_tax += cap_gains_tax
+
+                    # Net proceeds after tax
+                    net_proceeds = gross_draw - cap_gains_tax
+                    needed -= net_proceeds
+                    savings += net_proceeds
+
+        # Add capital gains tax to cumulative taxes
+        cumulative_taxes += yearly_cap_gains_tax
+
+        # Rebalance: move excess cash above buffer target to investments
+        assets = _rebalance_cash_to_investments(
+            assets=assets,
+            asset_configs=scenario.assets,
+            annual_expenses=total_expenses,
+            cash_buffer_months=scenario.assumptions.cash_buffer_months,
+        )
 
         # Build return overrides from sampled values
         return_overrides = {
@@ -362,6 +396,7 @@ def run_simulation_with_samples(
         accessible_net_worth = _calculate_accessible_net_worth(assets, scenario.assets)
 
         # Create snapshot
+        total_tax_with_cap_gains = tax_result.total_tax + yearly_cap_gains_tax
         snapshot = YearlySnapshot(
             year=year,
             age=age,
@@ -369,10 +404,12 @@ def run_simulation_with_samples(
             federal_tax=tax_result.federal_tax,
             state_tax=tax_result.state_tax,
             fica_tax=tax_result.fica_tax,
-            total_tax=tax_result.total_tax,
+            capital_gains_tax=yearly_cap_gains_tax,
+            total_tax=total_tax_with_cap_gains,
             net_income=net_income,
             total_expenses=total_expenses,
             savings=savings,
+            assets_sold=yearly_assets_sold,
             assets=dict(assets),
             net_worth=net_worth,
             accessible_net_worth=accessible_net_worth,
@@ -411,31 +448,50 @@ def run_simulation_with_samples(
         fire_target = None
 
     # Check FIRE and retirement milestones
-    # Get starting year for calculating projected IRS retirement age
-    start_year = snapshots[0].year if snapshots else datetime.now().year
-
     for snapshot in snapshots:
         year = snapshot.year
         age = snapshot.age
-        years_from_start = year - start_year
-
-        # Calculate projected IRS retirement age for this year
-        irs_age = scenario.assumptions.get_irs_retirement_age(years_from_start)
-
-        # Determine which net worth to use for FIRE calculation
-        # Before IRS retirement age: only count accessible funds (no 401k, IRA, HSA)
-        # At/after IRS retirement age: count all assets
-        if age < irs_age:
-            fire_net_worth = snapshot.accessible_net_worth
-        else:
-            fire_net_worth = snapshot.net_worth
 
         year_fire_target = snapshot.total_expenses if fire_basis == "current" else fire_target
 
         if milestones["retirement_ready"] is None and snapshot.net_worth >= year_fire_target * 25:
             milestones["retirement_ready"] = year
-        if milestones["fire_number"] is None and fire_net_worth * 0.04 >= year_fire_target:
-            milestones["fire_number"] = year
+
+        # FIRE calculation with bridge period consideration
+        # If retiring before IRS age, need:
+        #   1. Accessible funds to bridge until IRS age (cover expenses for gap years)
+        #   2. Retirement accounts to support 4% SWR after IRS age
+        # Note: IRS retirement age is a moving target that increases over time
+        if milestones["fire_number"] is None:
+            # Calculate years until this person can access retirement accounts
+            # This accounts for the IRS age increasing over time
+            years_until_irs = scenario.assumptions.get_years_until_irs_access(age)
+
+            if years_until_irs <= 0:
+                # At/after IRS age: simple 4% rule on total net worth
+                is_fire_ready = snapshot.net_worth * 0.04 >= year_fire_target
+            else:
+                # Before IRS age: need bridge funds + retirement account sustainability
+                bridge_needed = year_fire_target * years_until_irs
+
+                # Retirement accounts (locked until IRS age)
+                retirement_accounts = snapshot.net_worth - snapshot.accessible_net_worth
+
+                # Project retirement account growth during bridge period
+                # Use expected return from assumptions (mean of market return)
+                expected_return = scenario.assumptions.market_return_mean
+                projected_retirement = retirement_accounts * ((1 + expected_return) ** years_until_irs)
+
+                # FIRE ready if:
+                # 1. Accessible funds cover the bridge period
+                # 2. Projected retirement accounts support 4% SWR after bridge
+                has_bridge = snapshot.accessible_net_worth >= bridge_needed
+                has_post_irs = projected_retirement * 0.04 >= year_fire_target
+
+                is_fire_ready = has_bridge and has_post_irs
+
+            if is_fire_ready:
+                milestones["fire_number"] = year
 
     return SimulationResult(
         scenario_name=scenario.name,

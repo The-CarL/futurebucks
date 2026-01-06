@@ -325,6 +325,7 @@ def tax_breakdown_chart(result: SimulationResult) -> go.Figure:
     federal = [s.federal_tax for s in result.snapshots]
     state = [s.state_tax for s in result.snapshots]
     fica = [s.fica_tax for s in result.snapshots]
+    cap_gains = [s.capital_gains_tax for s in result.snapshots]
 
     fig = go.Figure()
 
@@ -354,6 +355,16 @@ def tax_breakdown_chart(result: SimulationResult) -> go.Figure:
             y=fica,
             name="FICA",
             marker_color="#17A2B8",
+            hovertemplate="$%{y:,.0f}<extra></extra>",
+        )
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=years,
+            y=cap_gains,
+            name="Capital Gains",
+            marker_color="#6F42C1",
             hovertemplate="$%{y:,.0f}<extra></extra>",
         )
     )

@@ -74,6 +74,10 @@ class PersonConfig(BaseModel):
     name: str
     birth_year: int
     retirement_age: int = 65
+    life_expectancy: int = Field(
+        default=95,
+        description="Expected lifespan for retirement planning (conservative default)",
+    )
 
 
 class IncomeSource(BaseModel):
@@ -203,6 +207,12 @@ class Assumptions(BaseModel):
         default=1.0,
         description="Expected increase in IRS retirement age per decade (e.g., 1.0 means 59.5 -> 60.5 over 10 years)",
     )
+    # Cash buffer strategy
+    cash_buffer_months: float = Field(
+        default=2.0,
+        ge=0.0,
+        description="Target cash buffer as months of expenses. High-risk tolerance = 1-2 months, conservative = 3-6 months.",
+    )
     # Monte Carlo mode options
     use_conservative_defaults: bool = Field(
         default=False,
@@ -238,6 +248,38 @@ class Assumptions(BaseModel):
         """
         decades = years_from_now / 10.0
         return self.irs_retirement_age + (decades * self.irs_retirement_age_increase_per_decade)
+
+    def get_years_until_irs_access(self, current_age: float) -> float:
+        """Calculate years until a person can access retirement accounts.
+
+        The IRS retirement age increases over time, so we need to find when
+        the person's age will catch up to the moving target.
+
+        Math: Person is eligible when age + t = irs_age + (t/10) * increase_per_decade
+        Solving: t = (irs_age - current_age) / (1 - increase_per_decade/10)
+
+        Args:
+            current_age: Person's current age
+
+        Returns:
+            Years until IRS retirement age eligibility (0 if already eligible)
+        """
+        if current_age >= self.irs_retirement_age:
+            return 0.0
+
+        # Rate at which IRS age increases per year
+        increase_per_year = self.irs_retirement_age_increase_per_decade / 10.0
+
+        # If IRS age increases >= 1 year per year, person never catches up
+        if increase_per_year >= 1.0:
+            return float("inf")
+
+        # Solve for t: current_age + t = irs_age + t * increase_per_year
+        # t * (1 - increase_per_year) = irs_age - current_age
+        # t = (irs_age - current_age) / (1 - increase_per_year)
+        years_until = (self.irs_retirement_age - current_age) / (1 - increase_per_year)
+
+        return max(0.0, years_until)
 
 
 class HealthcareConfig(BaseModel):
@@ -376,8 +418,22 @@ class Scenario(BaseModel):
         default=None,
         description="Healthcare cost configuration (pre-Medicare)",
     )
-    simulation_years: int = 30
+    start_year: int = Field(
+        default=2026,
+        description="Year to start the simulation (e.g., 2026)",
+    )
     monte_carlo: MonteCarloConfig = Field(default_factory=MonteCarloConfig)
+
+    @property
+    def simulation_years(self) -> int:
+        """Compute simulation years from start_year to IRS retirement age.
+
+        The simulation runs until the person can access retirement accounts
+        penalty-free (IRS retirement age, which increases over time).
+        """
+        current_age = self.start_year - self.person.birth_year
+        years_until_irs = self.assumptions.get_years_until_irs_access(float(current_age))
+        return int(years_until_irs)
 
 
 class YearlySnapshot(BaseModel):
@@ -389,10 +445,18 @@ class YearlySnapshot(BaseModel):
     federal_tax: float
     state_tax: float
     fica_tax: float
+    capital_gains_tax: float = Field(
+        default=0.0,
+        description="Capital gains tax from selling taxable investments to cover expenses",
+    )
     total_tax: float
     net_income: float
     total_expenses: float
     savings: float
+    assets_sold: float = Field(
+        default=0.0,
+        description="Total taxable assets sold this year to cover expenses",
+    )
     assets: dict[str, float] = Field(description="Asset name -> balance")
     net_worth: float
     accessible_net_worth: float = Field(

@@ -25,6 +25,7 @@ def basic_scenario():
             name="Test User",
             birth_year=1990,
             retirement_age=65,
+            life_expectancy=46,  # age 36 + 10 years of simulation
         ),
         income_sources=[
             IncomeSource(
@@ -56,7 +57,6 @@ def basic_scenario():
         ],
         life_events=[],
         assumptions=Assumptions(),
-        simulation_years=10,
     )
 
 
@@ -78,16 +78,16 @@ class TestSimulationBasics:
     def test_snapshots_have_correct_years(self, basic_scenario):
         """Snapshots should have sequential years."""
         result = run_simulation(basic_scenario)
-        current_year = datetime.now().year
+        start_year = basic_scenario.start_year
 
         for i, snapshot in enumerate(result.snapshots):
-            assert snapshot.year == current_year + i
+            assert snapshot.year == start_year + i
 
     def test_age_calculation(self, basic_scenario):
         """Age should be calculated correctly."""
         result = run_simulation(basic_scenario)
-        current_year = datetime.now().year
-        expected_age = current_year - basic_scenario.person.birth_year
+        start_year = basic_scenario.start_year
+        expected_age = start_year - basic_scenario.person.birth_year
 
         assert result.snapshots[0].age == expected_age
 
@@ -198,12 +198,12 @@ class TestLifeEvents:
 
     def test_income_change_event(self, basic_scenario):
         """Income change events should modify income."""
-        current_year = datetime.now().year
+        start_year = basic_scenario.start_year
 
         basic_scenario.life_events = [
             LifeEvent(
                 name="Big Raise",
-                year=current_year + 2,
+                year=start_year + 2,
                 type="income_change",
                 details={
                     "source_name": "Primary Job",
@@ -223,12 +223,12 @@ class TestLifeEvents:
 
     def test_child_event(self, basic_scenario):
         """Child event should add expenses."""
-        current_year = datetime.now().year
+        start_year = basic_scenario.start_year
 
         basic_scenario.life_events = [
             LifeEvent(
                 name="First Child",
-                year=current_year + 2,
+                year=start_year + 2,
                 type="child",
                 details={
                     "annual_cost": 15000,
@@ -246,12 +246,12 @@ class TestLifeEvents:
 
     def test_windfall_event(self, basic_scenario):
         """Windfall event should increase net worth."""
-        current_year = datetime.now().year
+        start_year = basic_scenario.start_year
 
         basic_scenario.life_events = [
             LifeEvent(
                 name="Inheritance",
-                year=current_year + 2,
+                year=start_year + 2,
                 type="windfall",
                 details={
                     "amount": 500000,
