@@ -24,12 +24,13 @@ BASE_IRA_CATCHUP = 1000
 BASE_HSA_LIMIT_FAMILY = 8300
 BASE_ROTH_IRA_INCOME_LIMIT_START = 230000  # MFJ phase-out starts
 BASE_ROTH_IRA_INCOME_LIMIT_END = 240000    # MFJ fully phased out
+BASE_STATE_STANDARD_DEDUCTION_NC = 25500   # NC MFJ standard deduction 2024
 
 # FICA rates (these don't change with inflation)
 SOCIAL_SECURITY_RATE = 0.062
 MEDICARE_RATE = 0.0145
 MEDICARE_ADDITIONAL_RATE = 0.009
-MEDICARE_ADDITIONAL_THRESHOLD = 200000
+MEDICARE_ADDITIONAL_THRESHOLD = 250000  # MFJ threshold
 
 
 def inflate_value(base_value: float, inflation_rate: float, years: int) -> float:
@@ -147,29 +148,37 @@ def calculate_taxes(
     state_rate: float = 0.0525,
     federal_brackets: list[tuple[float, float]] | None = None,
     ss_wage_cap: float | None = None,
+    employment_income: float | None = None,
+    state_standard_deduction: float | None = None,
 ) -> TaxBreakdown:
     """Calculate complete tax breakdown.
 
     Args:
-        gross_income: Total gross income
+        gross_income: Total gross income (employment + non-employment)
         pre_tax_deductions: 401k, HSA, and other pre-tax deductions
         standard_deduction: Federal standard deduction
         state_rate: State income tax rate
         federal_brackets: Federal tax brackets (uses 2024 MFJ if None)
         ss_wage_cap: Social Security wage cap (uses base 2024 value if None)
+        employment_income: Employment income only (for FICA). If None, uses gross_income.
+        state_standard_deduction: State standard deduction. If None, uses federal standard_deduction.
 
     Returns:
         TaxBreakdown with all tax components
     """
-    # Taxable income for federal/state
+    # Federal taxable income
     taxable_income = max(0, gross_income - pre_tax_deductions - standard_deduction)
 
-    # State typically uses similar taxable income (simplified)
-    state_taxable = max(0, gross_income - pre_tax_deductions - standard_deduction)
+    # State taxable income (states have their own standard deduction)
+    effective_state_deduction = state_standard_deduction if state_standard_deduction is not None else standard_deduction
+    state_taxable = max(0, gross_income - pre_tax_deductions - effective_state_deduction)
 
     federal = calculate_federal_tax(taxable_income, federal_brackets)
     state = calculate_state_tax(state_taxable, state_rate)
-    fica = calculate_fica_tax(gross_income, ss_wage_cap)
+
+    # FICA only applies to employment income, not windfalls/investment income
+    fica_income = employment_income if employment_income is not None else gross_income
+    fica = calculate_fica_tax(fica_income, ss_wage_cap)
 
     total = federal + state + fica
     effective_rate = total / gross_income if gross_income > 0 else 0.0
@@ -205,17 +214,17 @@ def calculate_capital_gains_tax(
         # Short-term gains taxed as ordinary income
         return calculate_federal_tax(ordinary_income + gains) - calculate_federal_tax(ordinary_income)
 
-    # 2024 Long-term capital gains brackets (single)
+    # 2024 Long-term capital gains brackets (MFJ)
     total_income = ordinary_income + gains
 
-    if total_income <= 47025:
+    if total_income <= 94050:
         return 0.0
-    elif total_income <= 518900:
+    elif total_income <= 583750:
         # 15% bracket
-        taxable_at_15 = min(gains, total_income - 47025)
+        taxable_at_15 = min(gains, total_income - 94050)
         return taxable_at_15 * 0.15
     else:
         # 20% bracket (simplified)
-        taxable_at_15 = max(0, 518900 - 47025 - ordinary_income)
+        taxable_at_15 = max(0, 583750 - 94050 - ordinary_income)
         taxable_at_20 = gains - taxable_at_15
         return taxable_at_15 * 0.15 + taxable_at_20 * 0.20

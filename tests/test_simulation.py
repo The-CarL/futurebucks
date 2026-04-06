@@ -13,6 +13,7 @@ from futurebucks.models import (
     Assumptions,
 )
 from futurebucks.simulation import run_simulation
+from futurebucks.tax_engine import calculate_fica_tax
 
 
 @pytest.fixture
@@ -290,3 +291,134 @@ class TestMilestones:
 
         # Should hit $100k milestone
         assert result.milestones["net_worth_100k"] is not None
+
+
+class TestWindfallFixes:
+    """Tests for windfall handling fixes."""
+
+    def test_multiple_windfalls_same_year(self, basic_scenario):
+        """Multiple windfall events in the same year should all be counted."""
+        start_year = basic_scenario.start_year
+
+        basic_scenario.life_events = [
+            LifeEvent(
+                name="Gift",
+                year=start_year + 1,
+                type="windfall",
+                details={"amount": 50000},  # No target - goes to income
+            ),
+            LifeEvent(
+                name="Inheritance",
+                year=start_year + 1,
+                type="windfall",
+                details={"amount": 100000, "target_asset": "Taxable Brokerage"},
+            ),
+        ]
+
+        result = run_simulation(basic_scenario)
+
+        # Year 0 has no windfall, year 1 should have both
+        # The $50k goes to gross income, the $100k goes directly to asset
+        year_1 = result.snapshots[1]
+
+        # Gross income should include the $50k windfall (but NOT the $100k allocated one)
+        expected_employment = 100000 * 1.03  # year 1 salary with 3% growth
+        assert year_1.gross_income > expected_employment
+        assert year_1.gross_income == pytest.approx(expected_employment + 50000, rel=0.01)
+
+    def test_allocated_windfall_no_fica(self, basic_scenario):
+        """Windfall allocated to target_asset should not appear in gross_income."""
+        start_year = basic_scenario.start_year
+
+        basic_scenario.life_events = [
+            LifeEvent(
+                name="Inheritance",
+                year=start_year + 1,
+                type="windfall",
+                details={"amount": 500000, "target_asset": "Taxable Brokerage"},
+            ),
+        ]
+
+        result = run_simulation(basic_scenario)
+        year_1 = result.snapshots[1]
+
+        # Gross income should be employment only (no windfall in income)
+        expected_employment = 100000 * 1.03
+        assert year_1.gross_income == pytest.approx(expected_employment, rel=0.01)
+
+
+class TestFICAFixes:
+    """Tests for FICA on employment income only."""
+
+    def test_fica_excludes_unallocated_windfall(self, basic_scenario):
+        """Unallocated windfall should not have FICA applied."""
+        start_year = basic_scenario.start_year
+
+        # Run without windfall
+        result_base = run_simulation(basic_scenario)
+        base_fica = result_base.snapshots[1].fica_tax
+
+        # Run with windfall
+        basic_scenario.life_events = [
+            LifeEvent(
+                name="Gift",
+                year=start_year + 1,
+                type="windfall",
+                details={"amount": 100000},  # Goes to gross income
+            ),
+        ]
+        result_windfall = run_simulation(basic_scenario)
+        windfall_fica = result_windfall.snapshots[1].fica_tax
+
+        # FICA should be the same since windfall isn't employment income
+        assert windfall_fica == pytest.approx(base_fica, rel=0.01)
+
+
+class TestCategoryInflationDeterministic:
+    """Tests for category-specific inflation in deterministic mode."""
+
+    def test_healthcare_expense_inflates_faster(self, basic_scenario):
+        """Healthcare expenses should inflate faster than general expenses."""
+        basic_scenario.expenses = [
+            Expense(
+                name="General",
+                amount=10000,
+                inflation_adjusted=True,
+                inflation_category="general",
+            ),
+            Expense(
+                name="Medical",
+                amount=10000,
+                inflation_adjusted=True,
+                inflation_category="healthcare",
+            ),
+        ]
+
+        result = run_simulation(basic_scenario)
+
+        # After several years, total expenses should be > 20k * general_inflation
+        # because healthcare inflates faster (5.5% vs 2.5%)
+        last = result.snapshots[-1]
+        years = len(result.snapshots) - 1
+        general_rate = basic_scenario.assumptions.get_inflation_rate("general").mean
+        healthcare_rate = basic_scenario.assumptions.get_inflation_rate("healthcare").mean
+
+        expected_general = 10000 * ((1 + general_rate) ** years)
+        expected_healthcare = 10000 * ((1 + healthcare_rate) ** years)
+
+        assert last.total_expenses == pytest.approx(
+            expected_general + expected_healthcare, rel=0.02
+        )
+        # Healthcare component should be larger
+        assert expected_healthcare > expected_general
+
+
+class TestNetIncomeConsistency:
+    """Tests for net_income and total_tax consistency."""
+
+    def test_net_income_equals_gross_minus_total_tax(self, basic_scenario):
+        """net_income should equal gross_income - total_tax (including cap gains)."""
+        result = run_simulation(basic_scenario)
+        for snapshot in result.snapshots:
+            expected_net = snapshot.gross_income - snapshot.total_tax
+            assert snapshot.net_income == pytest.approx(expected_net, rel=0.001)

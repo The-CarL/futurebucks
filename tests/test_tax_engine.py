@@ -89,12 +89,12 @@ class TestFicaTax:
         assert tax >= expected_ss + expected_medicare
 
     def test_additional_medicare_tax(self):
-        """Test additional Medicare tax above $200k."""
-        income = 250000
+        """Test additional Medicare tax above $250k (MFJ threshold)."""
+        income = 300000
         tax = calculate_fica_tax(income)
         expected_ss = BASE_SS_WAGE_CAP * 0.062
         base_medicare = income * 0.0145
-        additional_medicare = (income - 200000) * 0.009
+        additional_medicare = (income - 250000) * 0.009  # MFJ threshold
         assert tax == pytest.approx(expected_ss + base_medicare + additional_medicare)
 
 
@@ -154,10 +154,10 @@ class TestCapitalGainsTax:
         assert tax == pytest.approx(0)
 
     def test_long_term_15_percent_bracket(self):
-        """Middle income should have 15% long-term capital gains."""
-        # Total income of $100,000 (in 15% bracket)
-        tax = calculate_capital_gains_tax(20000, 80000)
-        # All gains should be taxed at 15%
+        """Middle income should have 15% long-term capital gains (MFJ)."""
+        # Total income of $200,000 (above $94,050 MFJ 0% threshold, in 15% bracket)
+        tax = calculate_capital_gains_tax(20000, 180000)
+        # All gains should be taxed at 15% (total income $200k, well above $94,050)
         assert tax == pytest.approx(20000 * 0.15)
 
     def test_short_term_gains(self):
@@ -165,3 +165,43 @@ class TestCapitalGainsTax:
         tax = calculate_capital_gains_tax(10000, 50000, is_long_term=False)
         # Should be the marginal tax on additional $10k of ordinary income
         assert tax > 0
+
+    def test_long_term_0_percent_bracket_mjf(self):
+        """MFJ 0% bracket extends to $94,050 total income."""
+        # $80k ordinary + $10k gains = $90k total, below $94,050
+        tax = calculate_capital_gains_tax(10000, 80000)
+        assert tax == pytest.approx(0)
+
+
+class TestCalculateTaxesExtended:
+    """Extended tests for calculate_taxes with new parameters."""
+
+    def test_employment_income_for_fica(self):
+        """FICA should use employment_income, not gross_income."""
+        # Gross = 300k (includes 200k windfall), employment = 100k
+        result = calculate_taxes(
+            gross_income=300000,
+            employment_income=100000,
+        )
+        expected_fica = calculate_fica_tax(100000)
+        assert result.fica_tax == pytest.approx(expected_fica)
+
+    def test_state_standard_deduction(self):
+        """State tax should use its own deduction when provided."""
+        # Federal deduction 29200, state deduction 25500
+        result_default = calculate_taxes(gross_income=100000)
+        result_state = calculate_taxes(
+            gross_income=100000,
+            state_standard_deduction=25500,
+        )
+        # State tax should be higher with smaller deduction
+        assert result_state.state_tax > result_default.state_tax
+
+    def test_no_additional_medicare_below_250k_mjf(self):
+        """No additional Medicare tax below $250k MFJ threshold."""
+        income = 240000
+        tax = calculate_fica_tax(income)
+        expected_ss = min(income, BASE_SS_WAGE_CAP) * 0.062
+        expected_medicare = income * 0.0145
+        # No additional Medicare (below $250k MFJ)
+        assert tax == pytest.approx(expected_ss + expected_medicare)

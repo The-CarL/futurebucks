@@ -20,24 +20,22 @@ from futurebucks.models import (
 )
 from futurebucks.simulation import (
     _is_active,
-    _calculate_gross_income,
-    _calculate_expenses,
     _calculate_healthcare_expenses,
     _apply_life_events,
     _allocate_savings,
     _apply_returns,
     _rebalance_cash_to_investments,
     _calculate_pre_tax_deductions,
-    _calculate_roth_ira_limit,
     _calculate_accessible_net_worth,
+    _calculate_bridge_needed,
 )
 from futurebucks.tax_engine import (
     calculate_taxes,
-    inflate_value,
     inflate_brackets,
     FEDERAL_BRACKETS_2024_MFJ,
     BASE_YEAR,
     BASE_STANDARD_DEDUCTION_MFJ,
+    BASE_STATE_STANDARD_DEDUCTION_NC,
     BASE_SS_WAGE_CAP,
     BASE_401K_LIMIT,
     BASE_401K_CATCHUP,
@@ -180,8 +178,11 @@ def run_simulation_with_samples(
 ) -> SimulationResult:
     """Run a single simulation using pre-sampled stochastic values.
 
-    This is a modified version of run_simulation that uses sampled values
-    instead of fixed means.
+    Fix #1: Uses cumulative compounding for inflation/growth instead of
+    applying a single year's rate across all years.
+
+    Also applies Fix #3 (FICA), Fix #5 (MAGI), Fix #6 (net_income),
+    Fix #11 (bridge inflation), Fix #12 (state deduction).
     """
     start_year = scenario.start_year
     end_year = start_year + scenario.simulation_years
@@ -210,55 +211,67 @@ def run_simulation_with_samples(
 
     cumulative_taxes = 0.0
 
+    # Fix #1: Track cumulative inflation factors for proper year-over-year compounding.
+    # From BASE_YEAR to start_year, use deterministic mean inflation.
+    base_to_start_years = max(0, start_year - BASE_YEAR)
+    base_inflation_mean = float(scenario.assumptions.get_inflation_rate("general").mean)
+    cumulative_general_factor = (1 + base_inflation_mean) ** base_to_start_years
+
+    # Track running income amounts per source (apply growth incrementally)
+    income_amounts: dict[str, float] = {
+        source.name: source.amount for source in income_sources
+    }
+
+    # Track running expense amounts per expense (apply inflation incrementally)
+    expense_amounts: dict[str, float] = {
+        expense.name: expense.amount for expense in expenses
+    }
+
+    # Track cumulative healthcare inflation factor from simulation start
+    cumulative_healthcare_factor = 1.0
+
     for year_idx, year in enumerate(range(start_year, end_year + 1)):
         age = year - scenario.person.birth_year
-        years_from_base = max(0, year - BASE_YEAR)
-        yearly_cap_gains_tax = 0.0  # Track capital gains tax for this year
-        yearly_assets_sold = 0.0  # Track assets sold to cover expenses
+        yearly_cap_gains_tax = 0.0
+        yearly_assets_sold = 0.0
 
-        # Get sampled inflation rates for this year (category-specific)
-        general_inflation = sampled.get_inflation_rate(year_idx, "general")
-        healthcare_inflation = sampled.get_inflation_rate(year_idx, "healthcare")
+        # Get sampled inflation rates for this year
+        general_inflation_this_year = sampled.get_inflation_rate(year_idx, "general")
+        healthcare_inflation_this_year = sampled.get_inflation_rate(year_idx, "healthcare")
 
-        # Build inflation overrides for expense calculation
-        inflation_rate_overrides = {
-            "general": general_inflation,
-            "healthcare": healthcare_inflation,
-            "education": sampled.get_inflation_rate(year_idx, "education"),
-            "housing": sampled.get_inflation_rate(year_idx, "housing"),
-        }
+        # Fix #1: Update cumulative factors year-over-year
+        if year_idx > 0:
+            cumulative_general_factor *= (1 + general_inflation_this_year)
+            cumulative_healthcare_factor *= (1 + healthcare_inflation_this_year)
 
-        # Calculate inflation-adjusted values for this year (using general inflation)
-        adjusted_standard_deduction = inflate_value(
-            BASE_STANDARD_DEDUCTION_MFJ, general_inflation, years_from_base
-        )
-        adjusted_ss_wage_cap = inflate_value(
-            BASE_SS_WAGE_CAP, general_inflation, years_from_base
-        )
-        adjusted_401k_limit = inflate_value(
-            BASE_401K_LIMIT, general_inflation, years_from_base
-        )
-        adjusted_401k_catchup = inflate_value(
-            BASE_401K_CATCHUP, general_inflation, years_from_base
-        )
-        adjusted_ira_limit = inflate_value(
-            BASE_IRA_LIMIT, general_inflation, years_from_base
-        )
-        adjusted_ira_catchup = inflate_value(
-            BASE_IRA_CATCHUP, general_inflation, years_from_base
-        )
-        adjusted_hsa_limit = inflate_value(
-            BASE_HSA_LIMIT_FAMILY, general_inflation, years_from_base
-        )
-        adjusted_roth_phase_out_start = inflate_value(
-            BASE_ROTH_IRA_INCOME_LIMIT_START, general_inflation, years_from_base
-        )
-        adjusted_roth_phase_out_end = inflate_value(
-            BASE_ROTH_IRA_INCOME_LIMIT_END, general_inflation, years_from_base
-        )
-        adjusted_brackets = inflate_brackets(
-            FEDERAL_BRACKETS_2024_MFJ, general_inflation, years_from_base
-        )
+            # Apply this year's inflation to running expense amounts
+            for expense in expenses:
+                if expense.inflation_adjusted and expense.name in expense_amounts:
+                    category = getattr(expense, "inflation_category", "general")
+                    category_rate = sampled.get_inflation_rate(year_idx, category)
+                    expense_amounts[expense.name] *= (1 + category_rate)
+
+            # Apply this year's growth to running income amounts
+            for source in income_sources:
+                if source.name in income_amounts:
+                    growth_rate = sampled.get_income_growth(source.name, year_idx)
+                    income_amounts[source.name] *= (1 + growth_rate)
+
+        # Use cumulative factor for tax bracket/limit inflation from BASE_YEAR
+        adjusted_standard_deduction = BASE_STANDARD_DEDUCTION_MFJ * cumulative_general_factor
+        adjusted_state_standard_deduction = BASE_STATE_STANDARD_DEDUCTION_NC * cumulative_general_factor
+        adjusted_ss_wage_cap = BASE_SS_WAGE_CAP * cumulative_general_factor
+        adjusted_401k_limit = BASE_401K_LIMIT * cumulative_general_factor
+        adjusted_401k_catchup = BASE_401K_CATCHUP * cumulative_general_factor
+        adjusted_ira_limit = BASE_IRA_LIMIT * cumulative_general_factor
+        adjusted_ira_catchup = BASE_IRA_CATCHUP * cumulative_general_factor
+        adjusted_hsa_limit = BASE_HSA_LIMIT_FAMILY * cumulative_general_factor
+        adjusted_roth_phase_out_start = BASE_ROTH_IRA_INCOME_LIMIT_START * cumulative_general_factor
+        adjusted_roth_phase_out_end = BASE_ROTH_IRA_INCOME_LIMIT_END * cumulative_general_factor
+        adjusted_brackets = [
+            (limit * cumulative_general_factor if limit != float("inf") else float("inf"), rate)
+            for limit, rate in FEDERAL_BRACKETS_2024_MFJ
+        ]
 
         # Apply life events for this year
         income_sources, expenses, assets, windfall = _apply_life_events(
@@ -267,32 +280,48 @@ def run_simulation_with_samples(
             expenses=expenses,
             assets=assets,
             events=scenario.life_events,
-            inflation_rate=general_inflation,
+            inflation_rate=general_inflation_this_year,
             start_year=start_year,
         )
 
-        # Build growth rate overrides from sampled values
-        growth_rate_overrides = {
-            source.name: sampled.get_income_growth(source.name, year_idx)
-            for source in income_sources
-        }
+        # Update tracking dicts for any new sources/expenses from life events
+        for source in income_sources:
+            if source.name not in income_amounts:
+                income_amounts[source.name] = source.amount
+        for expense in expenses:
+            if expense.name not in expense_amounts:
+                expense_amounts[expense.name] = expense.amount
 
-        # Calculate income with sampled growth rates (stops at retirement)
-        gross_income = _calculate_gross_income(
-            income_sources, year, start_year, retirement_year, growth_rate_overrides
-        )
-        gross_income += windfall
+        # Fix #3: Calculate employment income separately from windfall
+        employment_income = 0.0
+        for source in income_sources:
+            if not _is_active(source, year):
+                continue
+            if (
+                source.end_year is None
+                and retirement_year is not None
+                and year > retirement_year
+            ):
+                continue
+            employment_income += income_amounts.get(source.name, source.amount)
 
-        # Calculate regular expenses with category-specific inflation
-        total_expenses = _calculate_expenses(
-            expenses, year, start_year, general_inflation, inflation_rate_overrides
-        )
+        gross_income = employment_income + windfall
 
-        # Add healthcare expenses with healthcare-specific inflation
-        healthcare_expenses = _calculate_healthcare_expenses(
-            scenario, year, start_year, healthcare_inflation
-        )
-        total_expenses += healthcare_expenses
+        # Calculate expenses using running amounts (Fix #1: proper cumulative inflation)
+        total_expenses = 0.0
+        for expense in expenses:
+            if not _is_active(expense, year):
+                continue
+            total_expenses += expense_amounts.get(expense.name, expense.amount)
+
+        # Add healthcare expenses with cumulative healthcare inflation
+        if scenario.healthcare is not None:
+            base_cost = scenario.healthcare.calculate_annual_cost(
+                year=year,
+                person_birth_year=scenario.person.birth_year,
+            )
+            if base_cost > 0:
+                total_expenses += base_cost * cumulative_healthcare_factor
 
         # Estimate savings for pre-tax deduction calculation
         estimated_savings = gross_income * 0.7 - total_expenses
@@ -305,7 +334,7 @@ def run_simulation_with_samples(
             adjusted_hsa_limit,
         )
 
-        # Calculate taxes
+        # Fix #3: pass employment_income for FICA; Fix #12: state deduction
         tax_result = calculate_taxes(
             gross_income=gross_income,
             pre_tax_deductions=pre_tax_deductions,
@@ -313,12 +342,17 @@ def run_simulation_with_samples(
             state_rate=scenario.assumptions.state_tax_rate,
             federal_brackets=adjusted_brackets,
             ss_wage_cap=adjusted_ss_wage_cap,
+            employment_income=employment_income,
+            state_standard_deduction=adjusted_state_standard_deduction,
         )
 
         # Calculate actual savings
         net_income = gross_income - tax_result.total_tax
         savings = net_income - total_expenses
         cumulative_taxes += tax_result.total_tax
+
+        # Fix #5: Use MAGI for Roth IRA phase-out
+        magi = gross_income - pre_tax_deductions
 
         # Allocate savings to assets
         if savings > 0:
@@ -327,7 +361,7 @@ def run_simulation_with_samples(
                 assets=assets,
                 asset_configs=scenario.assets,
                 age=age,
-                gross_income=gross_income,
+                gross_income=magi,
                 limit_401k=adjusted_401k_limit,
                 limit_401k_catchup=adjusted_401k_catchup,
                 limit_hsa=adjusted_hsa_limit,
@@ -337,37 +371,32 @@ def run_simulation_with_samples(
                 roth_phase_out_end=adjusted_roth_phase_out_end,
             )
         elif savings < 0:
-            # Draw from taxable accounts if spending exceeds income
-            # Account for capital gains taxes on sales
-            # Assume 50% of portfolio is gains (reasonable for long-term holdings)
-            # Use 15% LTCG rate (could be 0%, 15%, or 20% depending on income)
             gain_fraction = 0.50
             ltcg_rate = 0.15
 
             needed = -savings
             for name, config in [(a.name, a) for a in scenario.assets]:
                 if config.type == "taxable" and name in assets and needed > 0:
-                    # Gross up withdrawal to cover taxes on gains
-                    # gross_sale = net_needed / (1 - tax_rate * gain_fraction)
                     tax_drag = ltcg_rate * gain_fraction
                     gross_needed = needed / (1 - tax_drag)
 
-                    # Don't withdraw more than available
                     gross_draw = min(gross_needed, assets[name])
                     assets[name] -= gross_draw
                     yearly_assets_sold += gross_draw
 
-                    # Calculate actual tax on this sale
                     cap_gains_tax = gross_draw * gain_fraction * ltcg_rate
                     yearly_cap_gains_tax += cap_gains_tax
 
-                    # Net proceeds after tax
                     net_proceeds = gross_draw - cap_gains_tax
                     needed -= net_proceeds
                     savings += net_proceeds
 
         # Add capital gains tax to cumulative taxes
         cumulative_taxes += yearly_cap_gains_tax
+
+        # Fix #6: net_income includes all taxes
+        total_tax_with_cap_gains = tax_result.total_tax + yearly_cap_gains_tax
+        net_income = gross_income - total_tax_with_cap_gains
 
         # Rebalance: move excess cash above buffer target to investments
         assets = _rebalance_cash_to_investments(
@@ -396,7 +425,6 @@ def run_simulation_with_samples(
         accessible_net_worth = _calculate_accessible_net_worth(assets, scenario.assets)
 
         # Create snapshot
-        total_tax_with_cap_gains = tax_result.total_tax + yearly_cap_gains_tax
         snapshot = YearlySnapshot(
             year=year,
             age=age,
@@ -448,6 +476,8 @@ def run_simulation_with_samples(
         fire_target = None
 
     # Check FIRE and retirement milestones
+    # Use mean general inflation for bridge calculation
+    general_inflation_mean = float(scenario.assumptions.get_inflation_rate("general").mean)
     for snapshot in snapshots:
         year = snapshot.year
         age = snapshot.age
@@ -457,34 +487,22 @@ def run_simulation_with_samples(
         if milestones["retirement_ready"] is None and snapshot.net_worth >= year_fire_target * 25:
             milestones["retirement_ready"] = year
 
-        # FIRE calculation with bridge period consideration
-        # If retiring before IRS age, need:
-        #   1. Accessible funds to bridge until IRS age (cover expenses for gap years)
-        #   2. Retirement accounts to support 4% SWR after IRS age
-        # Note: IRS retirement age is a moving target that increases over time
         if milestones["fire_number"] is None:
-            # Calculate years until this person can access retirement accounts
-            # This accounts for the IRS age increasing over time
             years_until_irs = scenario.assumptions.get_years_until_irs_access(age)
 
             if years_until_irs <= 0:
-                # At/after IRS age: simple 4% rule on total net worth
                 is_fire_ready = snapshot.net_worth * 0.04 >= year_fire_target
             else:
-                # Before IRS age: need bridge funds + retirement account sustainability
-                bridge_needed = year_fire_target * years_until_irs
+                # Fix #11: bridge accounts for inflation
+                bridge_needed = _calculate_bridge_needed(
+                    year_fire_target, years_until_irs, general_inflation_mean
+                )
 
-                # Retirement accounts (locked until IRS age)
                 retirement_accounts = snapshot.net_worth - snapshot.accessible_net_worth
 
-                # Project retirement account growth during bridge period
-                # Use expected return from assumptions (mean of market return)
                 expected_return = scenario.assumptions.market_return_mean
                 projected_retirement = retirement_accounts * ((1 + expected_return) ** years_until_irs)
 
-                # FIRE ready if:
-                # 1. Accessible funds cover the bridge period
-                # 2. Projected retirement accounts support 4% SWR after bridge
                 has_bridge = snapshot.accessible_net_worth >= bridge_needed
                 has_post_irs = projected_retirement * 0.04 >= year_fire_target
 
@@ -556,8 +574,8 @@ def _aggregate_results(
 
         net_worths = np.array([s.net_worth for s in year_data])
         incomes = np.array([s.gross_income for s in year_data])
-        expenses = np.array([s.total_expenses for s in year_data])
-        savings = np.array([s.savings for s in year_data])
+        expenses_arr = np.array([s.total_expenses for s in year_data])
+        savings_arr = np.array([s.savings for s in year_data])
 
         snapshot = MonteCarloSnapshot(
             year=year_data[0].year,
@@ -570,8 +588,8 @@ def _aggregate_results(
             net_worth_mean=float(np.mean(net_worths)),
             net_worth_stddev=float(np.std(net_worths)),
             gross_income_median=float(np.median(incomes)),
-            total_expenses_median=float(np.median(expenses)),
-            savings_median=float(np.median(savings)),
+            total_expenses_median=float(np.median(expenses_arr)),
+            savings_median=float(np.median(savings_arr)),
         )
         snapshots.append(snapshot)
 

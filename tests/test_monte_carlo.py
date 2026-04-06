@@ -242,6 +242,45 @@ class TestMonteCarloSimulation:
         assert len(result.final_net_worth_distribution) == 20
 
 
+class TestMCCompounding:
+    """Tests for correct cumulative compounding in MC mode."""
+
+    def test_expense_compounds_year_over_year(self):
+        """Expenses should compound year-over-year, not use single rate across all years."""
+        # Use a scenario with zero stddev so MC samples equal the mean
+        scenario = Scenario(
+            name="Compounding Test",
+            person=PersonConfig(name="Test", birth_year=1990, retirement_age=65),
+            income_sources=[
+                IncomeSource(name="Job", amount=200000, growth_rate={"mean": 0.0, "stddev": 0.0}),
+            ],
+            assets=[
+                Asset(name="Savings", type="taxable", balance=500000, expected_return={"mean": 0.0, "stddev": 0.0}),
+            ],
+            expenses=[
+                Expense(name="Living", amount=50000, inflation_adjusted=True),
+            ],
+            life_events=[],
+            assumptions=Assumptions(),
+        )
+
+        # Run MC with sampled scenario directly
+        rng = np.random.default_rng(42)
+        sampled = SampledScenario(scenario, rng)
+
+        result = run_simulation_with_samples(scenario, sampled)
+        assert len(result.snapshots) > 1
+
+        # Verify expenses compound correctly year-over-year
+        first_expenses = result.snapshots[0].total_expenses
+        assert first_expenses == pytest.approx(50000, rel=0.01)
+
+        # After N years, expense should reflect cumulative sampled inflation
+        # not a single rate raised to the Nth power
+        for i in range(1, min(5, len(result.snapshots))):
+            assert result.snapshots[i].total_expenses > result.snapshots[i - 1].total_expenses
+
+
 class TestBackwardCompatibility:
     """Tests for backward compatibility with scalar values."""
 

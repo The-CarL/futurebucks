@@ -76,7 +76,8 @@ class PersonConfig(BaseModel):
     retirement_age: int = 65
     life_expectancy: int = Field(
         default=95,
-        description="Expected lifespan for retirement planning (conservative default)",
+        description="Expected lifespan for retirement planning (used by presentation layer, "
+        "not the core simulation which runs to IRS retirement age)",
     )
 
 
@@ -168,6 +169,8 @@ class CategoryInflationRates(BaseModel):
 class Assumptions(BaseModel):
     """Economic and tax assumptions for the simulation."""
 
+    model_config = {"extra": "ignore"}  # Ignore legacy YAML fields
+
     # Support both old single inflation_rate and new category-specific rates
     inflation_rate: StochasticFloat | None = Field(
         default=None,
@@ -181,12 +184,6 @@ class Assumptions(BaseModel):
     market_return_stddev: float = 0.15  # Kept for reference/default
     state: str = "NC"
     state_tax_rate: float = 0.0525
-    federal_standard_deduction: float = 14600  # 2024 single
-    contribution_401k_limit: float = 23000  # 2024
-    contribution_401k_catchup: float = 7500  # age 50+
-    contribution_ira_limit: float = 7000  # 2024
-    contribution_ira_catchup: float = 1000  # age 50+
-    contribution_hsa_limit: float = 4150  # 2024 single
     # FIRE calculation settings
     fire_expense_basis: Literal["max", "first_year", "current", "target"] = Field(
         default="max",
